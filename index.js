@@ -157,6 +157,7 @@ app.get('/orders/:id', async (req, res) => {
 app.post('/orders', async (req, res) => {
   const {
     customer_id,
+    customer_name,
     total,
     status,
     payment_method,
@@ -165,8 +166,8 @@ app.post('/orders', async (req, res) => {
 
   try {
     const result = await pool.query(
-      'INSERT INTO orders (customer_id, total, status, payment_method, metadata) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [customer_id, total, status, payment_method, metadata]
+      'INSERT INTO orders (customer_id, customer_name, total, status, payment_method, metadata) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [customer_id, customer_name, total, status, payment_method, metadata]
     )
     res.status(201).json(result.rows[0])
   } catch (error) {
