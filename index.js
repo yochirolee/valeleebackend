@@ -1,8 +1,8 @@
 const express = require('express')
+require('dotenv').config() 
 const { pool } = require('./db')
 const bcrypt = require('bcrypt')
 const jwt = require('jsonwebtoken')
-require('dotenv').config()
 
 const PORT = process.env.PORT || 4000
 const HOST = process.env.HOST || '0.0.0.0'
@@ -65,12 +65,14 @@ app.get('/', (req, res) => {
   res.send('¡Tu backend con Express está funcionando! 🚀')
 })
 
+// 🔎 Listar productos (opcional: filtrar por categoría)
 app.get('/products', async (req, res) => {
   const { category_id } = req.query
 
   try {
-    let query = 'SELECT * FROM products'
-    let params = []
+    let query = 'SELECT id, title, description, price, weight, category_id, image_url, metadata FROM products'
+    const params = []
+
     if (category_id) {
       query += ' WHERE category_id = $1'
       params.push(Number(category_id))
@@ -84,36 +86,60 @@ app.get('/products', async (req, res) => {
   }
 })
 
+// 🔎 Obtener un producto por ID
 app.get('/products/:id', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM products WHERE id = $1', [req.params.id])
+    const result = await pool.query(
+      'SELECT id, title, description, price, weight, category_id, image_url, metadata FROM products WHERE id = $1',
+      [req.params.id]
+    )
     if (result.rows.length === 0) return res.status(404).send('Producto no encontrado')
     res.json(result.rows[0])
-  } catch {
+  } catch (error) {
+    console.error(error)
     res.status(500).send('Error al obtener producto')
   }
 })
 
+// ➕ Crear producto (solo title, nada de name)
 app.post('/products', async (req, res) => {
-  const { name, price, weight, category_id} = req.body
+  const { title, price, weight, category_id, image_url, description, metadata } = req.body
+
+  if (!title || price == null) {
+    return res.status(400).json({ error: 'title y price son requeridos' })
+  }
+
   try {
     const result = await pool.query(
-      'INSERT INTO products (name, price, weight, category_id) VALUES ($1, $2, $3, $4) RETURNING *',
-      [name, price, weight, category_id]
+      `INSERT INTO products (title, description, price, weight, category_id, image_url, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id, title, description, price, weight, category_id, image_url, metadata`,
+      [title, description || null, price, weight || null, category_id || null, image_url || null, metadata || {}]
     )
     res.status(201).json(result.rows[0])
-  } catch {
+  } catch (error) {
+    console.error(error)
     res.status(500).send('Error al crear producto')
   }
 })
 
+// ✏️ Actualizar producto (solo title)
 app.put('/products/:id', async (req, res) => {
-  const { name, price, weight, category_id } = req.body
+  const { title, price, weight, category_id, image_url, description, metadata } = req.body
 
   try {
     const result = await pool.query(
-      'UPDATE products SET name = $1, price = $2, weight = $3, category_id = $4 WHERE id = $5 RETURNING *',
-      [name, price, weight, category_id, req.params.id]
+      `UPDATE products
+         SET title = $1,
+             description = $2,
+             price = $3,
+             weight = $4,
+             category_id = $5,
+             image_url = $6,
+             metadata = $7
+       WHERE id = $8
+       RETURNING id, title, description, price, weight, category_id, image_url, metadata`,
+      [title || null, description || null, price, weight || null, category_id || null, image_url || null, metadata || {}, req.params.id]
     )
 
     if (result.rows.length === 0) return res.status(404).send('Producto no encontrado')
@@ -124,16 +150,18 @@ app.put('/products/:id', async (req, res) => {
   }
 })
 
-
+// 🗑️ Eliminar producto
 app.delete('/products/:id', async (req, res) => {
   try {
-    const result = await pool.query('DELETE FROM products WHERE id = $1 RETURNING *', [req.params.id])
+    const result = await pool.query('DELETE FROM products WHERE id = $1 RETURNING id', [req.params.id])
     if (result.rows.length === 0) return res.status(404).send('Producto no encontrado')
     res.json({ message: 'Producto eliminado' })
-  } catch {
+  } catch (error) {
+    console.error(error)
     res.status(500).send('Error al eliminar producto')
   }
 })
+
 
 app.get('/orders', async (req, res) => {
   try {

@@ -4,11 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon index.js",
-    "start": "node scripts/init-db.js && node index.js",
-    "init-db": "node scripts/init-db.js",
-    "seed-db": "node scripts/init-db.js"
-  },
+  "dev": "nodemon index.js",
+  "start": "node scripts/alter-products.js && node index.js"
+},
   "engines": { "node": ">=18" },
   "keywords": [],
   "author": "",

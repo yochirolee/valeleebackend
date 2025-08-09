@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS categories (
 
 CREATE TABLE IF NOT EXISTS products (
   id SERIAL PRIMARY KEY,
-  name TEXT NOT NULL,
+  title TEXT,
+  image_url TEXT,
   description TEXT,
   price NUMERIC(10, 2) NOT NULL,
   weight NUMERIC(10, 2),
