@@ -1,6 +1,9 @@
 CREATE TABLE IF NOT EXISTS customers (
   id SERIAL PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
+  first_name TEXT,
+  last_name TEXT,
+  phone TEXT,
   password TEXT NOT NULL,
   address TEXT,
   payment_method TEXT,
@@ -26,8 +29,10 @@ CREATE TABLE IF NOT EXISTS products (
 CREATE TABLE IF NOT EXISTS orders (
   id SERIAL PRIMARY KEY,
   customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
-  total_price NUMERIC(10, 2) NOT NULL,
+  customer_name TEXT NOT NULL,
+  total NUMERIC(10, 2) NOT NULL,
   status TEXT DEFAULT 'pending',
+  payment_method TEXT,
   created_at TIMESTAMP DEFAULT NOW(),
   metadata JSONB
 );

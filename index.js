@@ -15,32 +15,33 @@ const app = express()
 
 const cors = require('cors')
 
-const allowedOrigins = [
-  'http://localhost:3000',
-  process.env.CLIENT_ORIGIN,
-  // 'https://tu-dominio.com',
-]
+const originsFromEnv = (process.env.CLIENT_ORIGIN || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean)
 
-const corsOptions = {
-  origin: (origin, cb) => {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true)
-    return cb(new Error('Not allowed by CORS'))
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: false, // usas Bearer, no cookies
+const allowedOrigins = ['http://localhost:3000', ...originsFromEnv]
+
+// ✅ Permite prod exacto y (opcional) cualquier *.vercel.app para previews
+const allowVercelPreviews = true
+const isAllowed = (origin) => {
+  if (!origin) return true // Postman, curl, SSR
+  if (allowedOrigins.includes(origin)) return true
+  if (allowVercelPreviews && /^https:\/\/[a-z0-9-]+\.vercel\.app$/i.test(origin)) return true
+  return false
 }
 
-// 🔹 CORS primero, sin app.options('*', ...)
-app.use(cors(corsOptions))
+const corsOptions = {
+  origin: process.env.NODE_ENV === 'production'
+    ? (origin, cb) => isAllowed(origin) ? cb(null, true) : cb(new Error('Not allowed by CORS'))
+    : true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false, // usas Bearer
+}
 
-// 🔹 Manejo simple del preflight en Express 5 (sin usar '*')
-app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(204)
-  }
-  next()
-})
+app.use(cors(corsOptions))
+app.use((req, res, next) => (req.method === 'OPTIONS' ? res.sendStatus(204) : next()))
 
 app.use(express.json())
 
