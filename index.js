@@ -17,6 +17,7 @@ const cors = require('cors')
 
 const allowedOrigins = [
   'http://localhost:3000',
+  process.env.CLIENT_ORIGIN,
   // 'https://tu-dominio.com',
 ]
 
