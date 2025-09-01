@@ -4,7 +4,6 @@ const fs = require('fs')
 const path = require('path')
 const { Client } = require('pg')
 
-// Leer el archivo schema.sql
 const sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8')
 
 ;(async () => {
@@ -16,7 +15,6 @@ const sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8')
         ? { rejectUnauthorized: false }
         : undefined,
   })
-
   try {
     await client.connect()
     await client.query(sql)
