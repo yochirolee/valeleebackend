@@ -269,6 +269,13 @@ END $$;
 ALTER TABLE owners
   ADD COLUMN IF NOT EXISTS shipping_config jsonb NOT NULL DEFAULT '{}'::jsonb;
 
+ALTER TABLE categories
+  ADD COLUMN IF NOT EXISTS image_url TEXT;
+
+-- (ya lo tenías, pero no molesta repetir)
+ALTER TABLE products
+  ADD COLUMN IF NOT EXISTS image_url TEXT;  
+
 -- ==========================================================
 -- Índices (crear al final para que ya existan todas las columnas)
 -- ==========================================================
