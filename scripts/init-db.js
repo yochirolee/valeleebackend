@@ -70,33 +70,84 @@ CREATE TABLE IF NOT EXISTS cart_items (
   metadata JSONB
 );
 
--- 🔹 Seed
+CREATE TABLE IF NOT EXISTS owner_cu_areas (
+  id SERIAL PRIMARY KEY,
+  owner_id INTEGER NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+  province TEXT NOT NULL,
+  municipality TEXT,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS delivery_events (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  client_tx_id TEXT NOT NULL,
+  notes TEXT,
+  photo_url TEXT,
+  created_at TIMESTAMP DEFAULT NOW(),
+  UNIQUE(order_id, client_tx_id)
+);
+
+-- Índices útiles
+CREATE INDEX IF NOT EXISTS idx_delivery_events_order ON delivery_events(order_id);
+
+ALTER TABLE owner_shipping_config
+  ADD COLUMN IF NOT EXISTS cu_restrict_to_list boolean DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_status      ON orders (status);
+CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders (customer_id);
+CREATE INDEX IF NOT EXISTS idx_line_items_order   ON line_items (order_id);
+CREATE INDEX IF NOT EXISTS idx_customers_role ON customers ((metadata->>'role'));
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_owner_cu_area
+  ON owner_cu_areas(owner_id, lower(province), COALESCE(lower(municipality), ''));
+
+  CREATE INDEX IF NOT EXISTS idx_owner_cu_areas_owner_prov_mun
+ON owner_cu_areas (owner_id, lower(province), lower(COALESCE(municipality, '')));
+
+ALTER TABLE products
+  ADD CONSTRAINT stock_qty_nonnegative CHECK (stock_qty >= 0);
+
+  ALTER TABLE categories
+  ADD COLUMN IF NOT EXISTS image_url TEXT;
+
+  ALTER TABLE checkout_sessions
+ADD COLUMN IF NOT EXISTS payment_method text;
+
+-- 🔹 Seed categorías (con comas y upsert)
 INSERT INTO categories (slug, name) VALUES
-  ('food','Food'),
-  ('appliances','Appliances')
+  ('food', 'Food'),
+  ('clothing', 'Clothing'),
+  ('medicine', 'Medicine'),
+  ('appliances', 'Appliances'),
+  ('hygiene', 'Hygiene'),
+  ('technology', 'Technology')
 ON CONFLICT (slug) DO NOTHING;
 
-INSERT INTO products (name, description, price, weight, category_id, metadata)
+-- 🔹 Productos de ejemplo (usa title + image_url)
+INSERT INTO products (title, description, price, weight, category_id, image_url)
 SELECT 'Cafe La Llave','Cafe La Llave',5.00,1.00,c.id,
-       jsonb_build_object('image_url','https://valeleebackend.onrender.com/img/cafeLaLlave.jpg')
+       'https://valeleebackend.onrender.com/img/cafeLaLlave.jpg'
 FROM categories c
 WHERE c.slug='food'
-AND NOT EXISTS (SELECT 1 FROM products p WHERE p.name='Cafe La Llave');
+  AND NOT EXISTS (SELECT 1 FROM products p WHERE p.title='Cafe La Llave');
 
-INSERT INTO products (name, description, price, weight, category_id, metadata)
+INSERT INTO products (title, description, price, weight, category_id, image_url)
 SELECT 'Cafe Bustelo','Cafe Bustelo',6.00,1.00,c.id,
-       jsonb_build_object('image_url','https://valeleebackend.onrender.com/img/cafeBustelo.jpg')
+       'https://valeleebackend.onrender.com/img/cafeBustelo.jpg'
 FROM categories c
 WHERE c.slug='food'
-AND NOT EXISTS (SELECT 1 FROM products p WHERE p.name='Cafe Bustelo');
+  AND NOT EXISTS (SELECT 1 FROM products p WHERE p.title='Cafe Bustelo');
 
-INSERT INTO products (name, description, price, weight, category_id, metadata)
+INSERT INTO products (title, description, price, weight, category_id, image_url)
 SELECT 'Planta Electrica','Planta Electrica',300.00,100.00,c.id,
-       jsonb_build_object('image_url','https://valeleebackend.onrender.com/img/planta.jpg')
+       'https://valeleebackend.onrender.com/img/planta.jpg'
 FROM categories c
 WHERE c.slug='appliances'
-AND NOT EXISTS (SELECT 1 FROM products p WHERE p.name='Planta Electrica');
+  AND NOT EXISTS (SELECT 1 FROM products p WHERE p.title='Planta Electrica');
 `;
+
+
 
 (async () => {
   const client = new Client({

@@ -4,10 +4,14 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-  "dev": "nodemon index.js",
-  "start": "node scripts/alter-products.js && node index.js"
-},
-  "engines": { "node": ">=18" },
+    "dev": "nodemon index.js",
+    "start": "node index.js",   
+    "build": "tsc || echo \"no TS build\"",
+    "db:init": "node scripts/init-db.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -17,8 +21,13 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.16.3"
+    "multer": "^2.0.2",
+    "pg": "^8.16.3",
+    "resend": "^6.0.1",
+    "sharp": "^0.34.3",
+    "uuid": "^11.1.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.10"

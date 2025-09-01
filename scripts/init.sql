@@ -1,66 +1,30 @@
-CREATE TABLE IF NOT EXISTS customers (
-  id SERIAL PRIMARY KEY,
-  email TEXT UNIQUE NOT NULL,
-  first_name TEXT,
-  last_name TEXT,
-  phone TEXT,
-  password TEXT NOT NULL,
-  address TEXT,
-  payment_method TEXT,
-  metadata JSONB
-);
+// scripts/init-db.js
+require('dotenv').config()
+const fs = require('fs')
+const path = require('path')
+const { Client } = require('pg')
 
-CREATE TABLE IF NOT EXISTS categories (
-  id SERIAL PRIMARY KEY,
-  slug TEXT UNIQUE NOT NULL,
-  name TEXT NOT NULL
-);
+// Leer el archivo schema.sql
+const sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8')
 
-CREATE TABLE IF NOT EXISTS products (
-  id SERIAL PRIMARY KEY,
-  title TEXT,
-  image_url TEXT,
-  description TEXT,
-  price NUMERIC(10, 2) NOT NULL,
-  weight NUMERIC(10, 2),
-  category_id INTEGER REFERENCES categories(id),
-  metadata JSONB
-);
+;(async () => {
+  const client = new Client({
+    connectionString: process.env.DATABASE_URL,
+    ssl:
+      process.env.POSTGRES_SSL === 'true' ||
+      /render\.com|sslmode=require/.test(process.env.DATABASE_URL || '')
+        ? { rejectUnauthorized: false }
+        : undefined,
+  })
 
-CREATE TABLE IF NOT EXISTS orders (
-  id SERIAL PRIMARY KEY,
-  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
-  customer_name TEXT NOT NULL,
-  total NUMERIC(10, 2) NOT NULL,
-  status TEXT DEFAULT 'pending',
-  payment_method TEXT,
-  created_at TIMESTAMP DEFAULT NOW(),
-  metadata JSONB
-);
-
-CREATE TABLE IF NOT EXISTS line_items (
-  id SERIAL PRIMARY KEY,
-  order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
-  product_id INTEGER REFERENCES products(id),
-  quantity INTEGER NOT NULL,
-  unit_price NUMERIC(10, 2),
-  metadata JSONB
-);
-
-CREATE TABLE IF NOT EXISTS carts (
-  id SERIAL PRIMARY KEY,
-  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW(),
-  completed BOOLEAN DEFAULT FALSE,
-  metadata JSONB
-);
-
-CREATE TABLE IF NOT EXISTS cart_items (
-  id SERIAL PRIMARY KEY,
-  cart_id INTEGER REFERENCES carts(id) ON DELETE CASCADE,
-  product_id INTEGER REFERENCES products(id),
-  quantity INTEGER NOT NULL,
-  unit_price NUMERIC(10,2) NOT NULL,
-  metadata JSONB
-);
+  try {
+    await client.connect()
+    await client.query(sql)
+    console.log('✅ DB init completed successfully')
+  } catch (err) {
+    console.error('❌ DB init error:', err.message)
+    process.exit(1)
+  } finally {
+    await client.end()
+  }
+})()

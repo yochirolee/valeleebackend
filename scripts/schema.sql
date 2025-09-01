@@ -1,0 +1,211 @@
+BEGIN;
+
+-- 0) Extensiones (si en el futuro las necesitas)
+-- CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1) Núcleo
+CREATE TABLE IF NOT EXISTS customers (
+  id SERIAL PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,                -- único (sensible a mayúsculas por defecto)
+  first_name TEXT,
+  last_name TEXT,
+  phone TEXT,
+  password TEXT NOT NULL,
+  address TEXT,
+  payment_method TEXT,
+  metadata JSONB
+);
+
+-- Unicidad case-insensitive adicional
+CREATE UNIQUE INDEX IF NOT EXISTS customers_email_lower_uk
+  ON customers ((lower(email)));
+
+CREATE TABLE IF NOT EXISTS categories (
+  id SERIAL PRIMARY KEY,
+  slug TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  image_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS owners (
+  id SERIAL PRIMARY KEY,
+  name        TEXT NOT NULL,
+  email       TEXT NOT NULL UNIQUE,
+  phone       TEXT,
+  active      BOOLEAN NOT NULL DEFAULT true,
+  metadata    JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS products (
+  id SERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  image_url TEXT,
+  description TEXT,
+  price NUMERIC(10, 2) NOT NULL,
+  weight NUMERIC(10, 2),
+  stock_qty INTEGER NOT NULL DEFAULT 0,
+  category_id INTEGER REFERENCES categories(id),
+  owner_id INTEGER REFERENCES owners(id) ON DELETE RESTRICT,
+  metadata JSONB
+);
+
+-- Asegurar columna stock_qty si products ya existía sin ella
+ALTER TABLE products
+  ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0;
+
+-- CHECK para stock_qty >= 0 (compatible con distintas versiones)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'stock_qty_nonnegative'
+  ) THEN
+    ALTER TABLE products
+      ADD CONSTRAINT stock_qty_nonnegative CHECK (stock_qty >= 0);
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_products_owner    ON products(owner_id);
+CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);
+
+CREATE TABLE IF NOT EXISTS orders (
+  id SERIAL PRIMARY KEY,
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+  owner_id INTEGER REFERENCES owners(id),
+  customer_name TEXT,
+  total NUMERIC(10, 2) NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  payment_method TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  metadata JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_status      ON orders (status);
+CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders (customer_id);
+CREATE INDEX IF NOT EXISTS idx_orders_owner       ON orders (owner_id);
+
+CREATE TABLE IF NOT EXISTS line_items (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id),
+  quantity INTEGER NOT NULL,
+  unit_price NUMERIC(10, 2),
+  metadata JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_line_items_order   ON line_items (order_id);
+CREATE INDEX IF NOT EXISTS idx_line_items_product ON line_items (product_id);
+
+CREATE TABLE IF NOT EXISTS carts (
+  id SERIAL PRIMARY KEY,
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed BOOLEAN NOT NULL DEFAULT FALSE,
+  metadata JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_carts_customer ON carts(customer_id);
+
+CREATE TABLE IF NOT EXISTS cart_items (
+  id SERIAL PRIMARY KEY,
+  cart_id INTEGER REFERENCES carts(id) ON DELETE CASCADE,
+  product_id INTEGER REFERENCES products(id),
+  quantity INTEGER NOT NULL,
+  unit_price NUMERIC(10,2) NOT NULL,
+  metadata JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_cart_items_cart    ON cart_items(cart_id);
+CREATE INDEX IF NOT EXISTS idx_cart_items_product ON cart_items(product_id);
+
+-- 2) Config envíos por owner (simple)
+CREATE TABLE IF NOT EXISTS owner_shipping_config (
+  id SERIAL PRIMARY KEY,
+  owner_id INT NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+  country  CHAR(2) NOT NULL,                  -- 'US' o 'CU'
+  mode     TEXT NOT NULL CHECK (mode IN ('fixed','weight')),
+  currency CHAR(3) NOT NULL DEFAULT 'USD',
+
+  -- US fijo
+  us_flat NUMERIC(10,2),
+
+  -- Cuba fijas
+  cu_hab_city_flat    NUMERIC(10,2),
+  cu_hab_rural_flat   NUMERIC(10,2),
+  cu_other_city_flat  NUMERIC(10,2),
+  cu_other_rural_flat NUMERIC(10,2),
+
+  -- Cuba por peso
+  cu_rate_per_lb      NUMERIC(10,2),
+  cu_hab_city_base    NUMERIC(10,2),
+  cu_hab_rural_base   NUMERIC(10,2),
+  cu_other_city_base  NUMERIC(10,2),
+  cu_other_rural_base NUMERIC(10,2),
+  cu_min_fee          NUMERIC(10,2),
+
+  active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(owner_id, country)
+);
+
+-- Flags/ajustes adicionales
+ALTER TABLE owner_shipping_config
+  ADD COLUMN IF NOT EXISTS cu_restrict_to_list boolean DEFAULT false;
+
+-- 3) Áreas Cuba por owner
+CREATE TABLE IF NOT EXISTS owner_cu_areas (
+  id SERIAL PRIMARY KEY,
+  owner_id INTEGER NOT NULL REFERENCES owners(id) ON DELETE CASCADE,
+  province TEXT NOT NULL,
+  municipality TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_owner_cu_area
+  ON owner_cu_areas(owner_id, lower(province), COALESCE(lower(municipality), ''));
+CREATE INDEX IF NOT EXISTS idx_owner_cu_areas_owner_prov_mun
+  ON owner_cu_areas (owner_id, lower(province), lower(COALESCE(municipality, '')));
+
+-- 4) Checkout sessions
+CREATE TABLE IF NOT EXISTS checkout_sessions (
+  id BIGSERIAL PRIMARY KEY,
+  customer_id INT REFERENCES customers(id),
+  cart_id     INT REFERENCES carts(id),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','paid','failed','expired')),
+  amount_total NUMERIC(10,2) NOT NULL,
+  currency CHAR(3) NOT NULL DEFAULT 'USD',
+  snapshot JSONB NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  payment  JSONB,
+  payment_method TEXT,
+  created_order_ids INT[] NOT NULL DEFAULT '{}'::int[],
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  processed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_chk_sessions_cart     ON checkout_sessions(cart_id);
+CREATE INDEX IF NOT EXISTS idx_chk_sessions_customer ON checkout_sessions(customer_id);
+
+-- 5) Eventos de entrega
+CREATE TABLE IF NOT EXISTS delivery_events (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  client_tx_id TEXT NOT NULL,
+  notes TEXT,
+  photo_url TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(order_id, client_tx_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_events_order ON delivery_events(order_id);
+
+-- Extras que dijiste que usas
+ALTER TABLE owners
+  ADD COLUMN IF NOT EXISTS shipping_config jsonb NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_customers_role
+  ON customers ((metadata->>'role'));
+
+COMMIT;
