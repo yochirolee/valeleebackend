@@ -16,6 +16,37 @@ CREATE TABLE IF NOT EXISTS customers (
   metadata JSONB
 );
 
+-- Unicidad case-insensitive (limpieza + índice único)
+DO $$
+BEGIN
+  -- 1) Normaliza espacios
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_name='customers' AND column_name='email') THEN
+    UPDATE customers SET email = trim(BOTH FROM email);
+  END IF;
+
+  -- 2) Elimina duplicados por lower(email), dejando el menor id
+  IF EXISTS (
+    SELECT 1 FROM customers GROUP BY lower(email) HAVING count(*) > 1
+  ) THEN
+    WITH ranked AS (
+      SELECT id, lower(email) AS e, ROW_NUMBER() OVER (PARTITION BY lower(email) ORDER BY id) AS rn
+      FROM customers
+    )
+    DELETE FROM customers c USING ranked r
+    WHERE c.id = r.id AND r.rn > 1;
+  END IF;
+
+  -- 3) Crea el índice único si no existe
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname = 'public' AND indexname = 'customers_email_lower_uk'
+  ) THEN
+    EXECUTE 'CREATE UNIQUE INDEX customers_email_lower_uk ON customers ((lower(email)))';
+  END IF;
+END $$;
+
+
 -- Unicidad case-insensitive adicional
 CREATE UNIQUE INDEX IF NOT EXISTS customers_email_lower_uk
   ON customers ((lower(email)));
