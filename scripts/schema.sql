@@ -16,41 +16,6 @@ CREATE TABLE IF NOT EXISTS customers (
   metadata JSONB
 );
 
--- Unicidad case-insensitive (limpieza + índice único)
-DO $$
-BEGIN
-  -- 1) Normaliza espacios
-  IF EXISTS (SELECT 1 FROM information_schema.columns
-             WHERE table_name='customers' AND column_name='email') THEN
-    UPDATE customers SET email = trim(BOTH FROM email);
-  END IF;
-
-  -- 2) Elimina duplicados por lower(email), dejando el menor id
-  IF EXISTS (
-    SELECT 1 FROM customers GROUP BY lower(email) HAVING count(*) > 1
-  ) THEN
-    WITH ranked AS (
-      SELECT id, lower(email) AS e, ROW_NUMBER() OVER (PARTITION BY lower(email) ORDER BY id) AS rn
-      FROM customers
-    )
-    DELETE FROM customers c USING ranked r
-    WHERE c.id = r.id AND r.rn > 1;
-  END IF;
-
-  -- 3) Crea el índice único si no existe
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_indexes
-    WHERE schemaname = 'public' AND indexname = 'customers_email_lower_uk'
-  ) THEN
-    EXECUTE 'CREATE UNIQUE INDEX customers_email_lower_uk ON customers ((lower(email)))';
-  END IF;
-END $$;
-
-
--- Unicidad case-insensitive adicional
-CREATE UNIQUE INDEX IF NOT EXISTS customers_email_lower_uk
-  ON customers ((lower(email)));
-
 CREATE TABLE IF NOT EXISTS categories (
   id SERIAL PRIMARY KEY,
   slug TEXT UNIQUE NOT NULL,
@@ -81,24 +46,6 @@ CREATE TABLE IF NOT EXISTS products (
   metadata JSONB
 );
 
--- Asegurar columna stock_qty si products ya existía sin ella
-ALTER TABLE products
-  ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0;
-
--- CHECK para stock_qty >= 0 (compatible con distintas versiones)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint WHERE conname = 'stock_qty_nonnegative'
-  ) THEN
-    ALTER TABLE products
-      ADD CONSTRAINT stock_qty_nonnegative CHECK (stock_qty >= 0);
-  END IF;
-END $$;
-
-CREATE INDEX IF NOT EXISTS idx_products_owner    ON products(owner_id);
-CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);
-
 CREATE TABLE IF NOT EXISTS orders (
   id SERIAL PRIMARY KEY,
   customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
@@ -111,11 +58,6 @@ CREATE TABLE IF NOT EXISTS orders (
   metadata JSONB
 );
 
-CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_orders_status      ON orders (status);
-CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders (customer_id);
-CREATE INDEX IF NOT EXISTS idx_orders_owner       ON orders (owner_id);
-
 CREATE TABLE IF NOT EXISTS line_items (
   id SERIAL PRIMARY KEY,
   order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
@@ -124,9 +66,6 @@ CREATE TABLE IF NOT EXISTS line_items (
   unit_price NUMERIC(10, 2),
   metadata JSONB
 );
-
-CREATE INDEX IF NOT EXISTS idx_line_items_order   ON line_items (order_id);
-CREATE INDEX IF NOT EXISTS idx_line_items_product ON line_items (product_id);
 
 CREATE TABLE IF NOT EXISTS carts (
   id SERIAL PRIMARY KEY,
@@ -137,8 +76,6 @@ CREATE TABLE IF NOT EXISTS carts (
   metadata JSONB
 );
 
-CREATE INDEX IF NOT EXISTS idx_carts_customer ON carts(customer_id);
-
 CREATE TABLE IF NOT EXISTS cart_items (
   id SERIAL PRIMARY KEY,
   cart_id INTEGER REFERENCES carts(id) ON DELETE CASCADE,
@@ -147,9 +84,6 @@ CREATE TABLE IF NOT EXISTS cart_items (
   unit_price NUMERIC(10,2) NOT NULL,
   metadata JSONB
 );
-
-CREATE INDEX IF NOT EXISTS idx_cart_items_cart    ON cart_items(cart_id);
-CREATE INDEX IF NOT EXISTS idx_cart_items_product ON cart_items(product_id);
 
 -- 2) Config envíos por owner (simple)
 CREATE TABLE IF NOT EXISTS owner_shipping_config (
@@ -194,11 +128,6 @@ CREATE TABLE IF NOT EXISTS owner_cu_areas (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uniq_owner_cu_area
-  ON owner_cu_areas(owner_id, lower(province), COALESCE(lower(municipality), ''));
-CREATE INDEX IF NOT EXISTS idx_owner_cu_areas_owner_prov_mun
-  ON owner_cu_areas (owner_id, lower(province), lower(COALESCE(municipality, '')));
-
 -- 4) Checkout sessions
 CREATE TABLE IF NOT EXISTS checkout_sessions (
   id BIGSERIAL PRIMARY KEY,
@@ -216,9 +145,6 @@ CREATE TABLE IF NOT EXISTS checkout_sessions (
   processed_at TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS idx_chk_sessions_cart     ON checkout_sessions(cart_id);
-CREATE INDEX IF NOT EXISTS idx_chk_sessions_customer ON checkout_sessions(customer_id);
-
 -- 5) Eventos de entrega
 CREATE TABLE IF NOT EXISTS delivery_events (
   id SERIAL PRIMARY KEY,
@@ -230,12 +156,156 @@ CREATE TABLE IF NOT EXISTS delivery_events (
   UNIQUE(order_id, client_tx_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_delivery_events_order ON delivery_events(order_id);
+-- ==========================================================
+-- Asegurar compatibilidad con BD que ya existía (columnas/FKs)
+-- ==========================================================
 
--- Extras que dijiste que usas
+-- customers: unicidad case-insensitive (limpieza + índice único)
+DO $$
+BEGIN
+  -- 1) Normaliza espacios
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_name='customers' AND column_name='email') THEN
+    UPDATE customers SET email = trim(BOTH FROM email);
+  END IF;
+
+  -- 2) Elimina duplicados por lower(email), dejando el menor id
+  IF EXISTS (
+    SELECT 1 FROM customers GROUP BY lower(email) HAVING count(*) > 1
+  ) THEN
+    WITH ranked AS (
+      SELECT id, lower(email) AS e, ROW_NUMBER() OVER (PARTITION BY lower(email) ORDER BY id) AS rn
+      FROM customers
+    )
+    DELETE FROM customers c USING ranked r
+    WHERE c.id = r.id AND r.rn > 1;
+  END IF;
+
+  -- 3) Crea el índice único si no existe
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname = 'public' AND indexname = 'customers_email_lower_uk'
+  ) THEN
+    EXECUTE 'CREATE UNIQUE INDEX customers_email_lower_uk ON customers ((lower(email)))';
+  END IF;
+END $$;
+
+-- products: asegurar columnas si ya existía vieja
+ALTER TABLE products
+  ADD COLUMN IF NOT EXISTS title TEXT,
+  ADD COLUMN IF NOT EXISTS image_url TEXT,
+  ADD COLUMN IF NOT EXISTS description TEXT,
+  ADD COLUMN IF NOT EXISTS weight NUMERIC(10,2),
+  ADD COLUMN IF NOT EXISTS metadata JSONB,
+  ADD COLUMN IF NOT EXISTS owner_id INT,
+  ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0;
+
+-- CHECK para stock_qty >= 0 (compatible con distintas versiones)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'stock_qty_nonnegative'
+  ) THEN
+    ALTER TABLE products
+      ADD CONSTRAINT stock_qty_nonnegative CHECK (stock_qty >= 0);
+  END IF;
+END $$;
+
+-- FK products.owner_id -> owners(id), solo si no existe ya
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class t ON c.conrelid = t.oid
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (c.conkey)
+    WHERE t.relname = 'products' AND c.contype = 'f' AND a.attname = 'owner_id'
+  ) THEN
+    ALTER TABLE products
+      ADD CONSTRAINT fk_products_owner
+      FOREIGN KEY (owner_id) REFERENCES owners(id) ON DELETE RESTRICT;
+  END IF;
+END $$;
+
+-- orders: owner_id si faltara + FK
+ALTER TABLE orders
+  ADD COLUMN IF NOT EXISTS owner_id INT;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class t ON c.conrelid = t.oid
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (c.conkey)
+    WHERE t.relname = 'orders' AND c.contype = 'f' AND a.attname = 'owner_id'
+  ) THEN
+    ALTER TABLE orders
+      ADD CONSTRAINT orders_owner_id_fkey
+      FOREIGN KEY (owner_id) REFERENCES owners(id);
+  END IF;
+END $$;
+
+-- owner_cu_areas: por si existía sin owner_id + FK
+ALTER TABLE owner_cu_areas
+  ADD COLUMN IF NOT EXISTS owner_id INT;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class t ON c.conrelid = t.oid
+    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY (c.conkey)
+    WHERE t.relname = 'owner_cu_areas' AND c.contype = 'f' AND a.attname = 'owner_id'
+  ) THEN
+    ALTER TABLE owner_cu_areas
+      ADD CONSTRAINT owner_cu_areas_owner_id_fkey
+      FOREIGN KEY (owner_id) REFERENCES owners(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+-- owners: shipping_config si faltara
 ALTER TABLE owners
   ADD COLUMN IF NOT EXISTS shipping_config jsonb NOT NULL DEFAULT '{}'::jsonb;
 
+-- ==========================================================
+-- Índices (crear al final para que ya existan todas las columnas)
+-- ==========================================================
+
+-- products
+CREATE INDEX IF NOT EXISTS idx_products_owner    ON products(owner_id);
+CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);
+
+-- orders
+CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_orders_status      ON orders (status);
+CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders (customer_id);
+CREATE INDEX IF NOT EXISTS idx_orders_owner       ON orders (owner_id);
+
+-- line_items
+CREATE INDEX IF NOT EXISTS idx_line_items_order   ON line_items (order_id);
+CREATE INDEX IF NOT EXISTS idx_line_items_product ON line_items (product_id);
+
+-- carts / cart_items
+CREATE INDEX IF NOT EXISTS idx_carts_customer     ON carts(customer_id);
+CREATE INDEX IF NOT EXISTS idx_cart_items_cart    ON cart_items(cart_id);
+CREATE INDEX IF NOT EXISTS idx_cart_items_product ON cart_items(product_id);
+
+-- owner_cu_areas
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_owner_cu_area
+  ON owner_cu_areas(owner_id, lower(province), COALESCE(lower(municipality), ''));
+CREATE INDEX IF NOT EXISTS idx_owner_cu_areas_owner_prov_mun
+  ON owner_cu_areas (owner_id, lower(province), lower(COALESCE(municipality, '')));
+
+-- checkout_sessions
+CREATE INDEX IF NOT EXISTS idx_chk_sessions_cart     ON checkout_sessions(cart_id);
+CREATE INDEX IF NOT EXISTS idx_chk_sessions_customer ON checkout_sessions(customer_id);
+
+-- delivery_events
+CREATE INDEX IF NOT EXISTS idx_delivery_events_order ON delivery_events(order_id);
+
+-- customers (consultas por rol)
 CREATE INDEX IF NOT EXISTS idx_customers_role
   ON customers ((metadata->>'role'));
 
