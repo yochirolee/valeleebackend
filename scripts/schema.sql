@@ -322,11 +322,6 @@ CREATE INDEX IF NOT EXISTS idx_customers_role
 ALTER TABLE products
   ADD COLUMN IF NOT EXISTS title TEXT;
 
--- 2) Backfill: si hay filas donde 'title' esté NULL pero 'name' tenga valor, copiamos
-UPDATE products
-SET title = name
-WHERE title IS NULL AND name IS NOT NULL;
-
 -- 3) (Opcional pero recomendado) establece NOT NULL en 'title' si ya no quedan nulls
 DO $$
 BEGIN
@@ -339,9 +334,5 @@ BEGIN
     ALTER TABLE products ALTER COLUMN title SET NOT NULL;
   END IF;
 END $$;
-
--- 4) Elimina definitivamente 'name' (no falla si ya no existe)
-ALTER TABLE products DROP COLUMN IF EXISTS name;
-
 
 COMMIT;
