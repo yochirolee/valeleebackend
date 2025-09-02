@@ -65,16 +65,6 @@ const sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8')
         console.log('ℹ️ ADMIN_EMAILS vacío; no se aplicaron roles.')
       }
 
-      const purge = (process.env.PURGE_PRODUCTS || '').toLowerCase();
-
-      if (purge === 'all') {
-        console.warn('⚠️ PURGE_PRODUCTS=all -> TRUNCATE products (cascade).');
-        await client.query('BEGIN');
-        await client.query('TRUNCATE TABLE products RESTART IDENTITY CASCADE');
-        await client.query('COMMIT');
-        console.log('✅ Purga completa: products (y dependientes) vaciados.');
-      }
-
       console.log('✅ DB init completed successfully')
     } catch (err) {
       try { await client.query('ROLLBACK') } catch { }

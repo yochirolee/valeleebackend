@@ -51,15 +51,19 @@ function toAbsoluteUrl(u) {
 function renderAddressHTML(ship) {
   if (!ship || typeof ship !== 'object') return '';
 
-  const addrCU = `
-    ${ship.address || ''}${ship.address && (ship.municipality || ship.province) ? '<br/>' : ''}
-    ${[ship.municipality, ship.province].filter(Boolean).join(', ')}
-  `.trim();
+  // ---- Cuba ----
+  const cuLines = [
+    ship.address || '',
+    [ship.municipality, ship.province].filter(Boolean).join(', ')
+  ].filter(s => String(s).trim() !== '');
+  // Escapamos cada línea y luego unimos con <br/>
+  const addrCU = cuLines.map(esc).join('<br/>');
 
-  const addrUS = `
-    ${ship.address_line1 || ''}${ship.address_line2 ? ` ${ship.address_line2}` : ''}${(ship.city || ship.state || ship.zip) ? '<br/>' : ''}
-    ${[ship.city, ship.state, ship.zip].filter(Boolean).join(', ')}
-  `.trim();
+  // ---- US ----
+  const usLine1 = [ship.address_line1, ship.address_line2].filter(Boolean).join(' ');
+  const usLine2 = [ship.city, ship.state, ship.zip].filter(Boolean).join(', ');
+  const usLines = [usLine1, usLine2].filter(s => String(s).trim() !== '');
+  const addrUS = usLines.map(esc).join('<br/>');
 
   const addressBlock = (ship.country === 'US') ? addrUS : addrCU;
 
@@ -78,7 +82,7 @@ function renderAddressHTML(ship) {
       <tbody>
         <tr><td style="padding:4px 0;font-weight:600;">Nombre:</td><td style="padding:4px 0;">${esc([ship.first_name, ship.last_name].filter(Boolean).join(' '))}</td></tr>
         ${contactBlock}
-        <tr><td style="padding:4px 0;font-weight:600;">Dirección:</td><td style="padding:4px 0;">${esc(addressBlock)}</td></tr>
+        <tr><td style="padding:4px 0;font-weight:600;">Dirección:</td><td style="padding:4px 0;">${addressBlock}</td></tr>
         ${instructionsBlock}
       </tbody>
     </table>
