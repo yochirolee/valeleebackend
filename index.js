@@ -94,7 +94,7 @@ app.use('/payments', paymentsRouter)
 const checkoutDirectRoutes = require('./routes/checkout_direct');
 const paymentsDirectRoutes = require('./routes/payments_direct');
 app.use('/checkout-direct', checkoutDirectRoutes);   // POST /checkout-direct/start-direct
-app.use('/payments-direct', paymentsDirectRoutes); 
+app.use('/payments-direct', paymentsDirectRoutes);
 
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
   .split(',')
@@ -369,7 +369,7 @@ app.get('/products/best-sellers', async (req, res) => {
       ` : `TRUE`;
 
       params.push(prov); const iProv = params.length;   // $2
-      params.push(mun);  const iMun  = params.length;   // $3
+      params.push(mun); const iMun = params.length;   // $3
 
       locationSql = `
         (
@@ -499,7 +499,7 @@ app.get('/products/search', async (req, res) => {
       ` : `TRUE`;
 
       params.push(prov); const iProv = params.length;
-      params.push(mun);  const iMun  = params.length;
+      params.push(mun); const iMun = params.length;
 
       locationSql = `
         (
@@ -801,13 +801,37 @@ app.get('/orders', authenticateToken, requireAdmin, async (req, res) => {
 app.get('/orders/:id', authenticateToken, async (req, res) => {
   try {
     const id = Number(req.params.id)
-    const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [id])
+    const { rows } = await pool.query(
+      `SELECT 
+         o.*,
+         ow.id   AS owner_id_join,
+         ow.name AS owner_name,
+         ow.phone AS owner_phone,
+         ow.email AS owner_email
+       FROM orders o
+       LEFT JOIN owners ow ON ow.id = o.owner_id
+       WHERE o.id = $1
+       LIMIT 1`,
+      [id]
+    )
     if (!rows.length) return res.status(404).send('Orden no encontrada')
-    const order = rows[0]
+    const row = rows[0]
 
-    const isOwner = Number(order.customer_id) === Number(req.user.id)
+    const isOwner = Number(row.customer_id) === Number(req.user.id)
     const isAdmin = await isAdminUser(req.user.id)
     if (!isOwner && !isAdmin) return res.sendStatus(403)
+
+    // 🔹 Inserta objeto owner en la respuesta
+    const order = {
+      ...row,
+      owner: row.owner_id_join ? {
+        id: row.owner_id_join,
+        name: row.owner_name || null,
+        phone: row.owner_phone || null,
+        whatsapp: row.owner_phone || null,
+        email: row.owner_email || null,
+      } : null
+    }
 
     return res.json(order)
   } catch (e) {
@@ -815,7 +839,6 @@ app.get('/orders/:id', authenticateToken, async (req, res) => {
     return res.status(500).send('Error al obtener orden')
   }
 })
-
 
 // Crear orden (admin si lo usas manualmente; checkout ya crea)
 app.post('/orders', authenticateToken, requireAdmin, async (req, res) => {
@@ -873,11 +896,11 @@ app.get('/checkout-sessions/:id', async (req, res) => {
         WHERE id = $1`,
       [id]
     );
-    if (!rows.length) return res.status(404).json({ ok:false, message:'Sesión no encontrada' });
+    if (!rows.length) return res.status(404).json({ ok: false, message: 'Sesión no encontrada' });
     const s = rows[0];
-    return res.json({ ok:true, session: s });
+    return res.json({ ok: true, session: s });
   } catch (e) {
-    return res.status(500).json({ ok:false, message:e.message || 'Error leyendo sesión' });
+    return res.status(500).json({ ok: false, message: e.message || 'Error leyendo sesión' });
   }
 });
 
@@ -888,11 +911,19 @@ app.get('/orders/:id/detail', authenticateToken, async (req, res) => {
 
     // Cabecera
     const { rows: head } = await pool.query(
-      `SELECT o.*, c.email, c.first_name, c.last_name
-         FROM orders o
-         LEFT JOIN customers c ON c.id = o.customer_id
+      `SELECT 
+          o.*,
+          c.email, c.first_name, c.last_name,
+          ow.id   AS owner_id_join,
+          ow.name AS owner_name,
+          ow.phone AS owner_phone,
+          ow.email AS owner_email
+        FROM orders o
+        LEFT JOIN customers c ON c.id = o.customer_id
+        LEFT JOIN owners   ow ON ow.id = o.owner_id
         WHERE o.id = $1
-        LIMIT 1`,
+        LIMIT 1
+        `,
       [id]
     );
     if (!head.length) return res.status(404).send('Orden no encontrada');
@@ -926,6 +957,13 @@ app.get('/orders/:id/detail', authenticateToken, async (req, res) => {
         status: order.status,
         payment_method: order.payment_method,
         metadata: order.metadata || {},
+        owner: order.owner_id_join ? {
+          id: order.owner_id_join,
+          name: order.owner_name || null,
+          phone: order.owner_phone || null,
+          whatsapp: order.owner_phone || null,
+          email: order.owner_email || null,
+        } : null,
       },
       items: items.map(it => ({
         product_id: it.product_id,
@@ -1427,7 +1465,7 @@ app.patch('/partner/orders/:id/status', authenticateToken, requirePartnerOrAdmin
   const userId = req.user.id
 
   const { role, owner_id } = await getUserRoleAndOwnerId(userId)
-  const allowed = new Set(['shipped','delivered'])
+  const allowed = new Set(['shipped', 'delivered'])
   if (!allowed.has(nextStatus)) return res.status(400).json({ error: 'Estado inválido' })
 
   const { rows } = await pool.query(`SELECT id, owner_id, status, metadata FROM orders WHERE id=$1 LIMIT 1`, [id])
@@ -1464,6 +1502,13 @@ app.patch('/partner/orders/:id/status', authenticateToken, requirePartnerOrAdmin
                             'status_times',
                             COALESCE(metadata->'status_times','{}'::jsonb) || jsonb_build_object($2::text, $3::text)
                           )
+                       || CASE WHEN $1 = 'delivered' THEN
+                            jsonb_build_object(
+                              'delivery',
+                              COALESCE(metadata->'delivery','{}'::jsonb) ||
+                              jsonb_build_object('delivered', true, 'delivered_at', $3::text)
+                            )
+                          ELSE '{}'::jsonb END
       WHERE id = $4
       RETURNING id, status, metadata, created_at`,
     [nextStatus, timeKey, nowISO, id]
@@ -1535,7 +1580,7 @@ app.patch('/admin/customers/:id/role-owner', authenticateToken, requireAdmin, as
     }
 
     // Para roles válidos (admin | owner | delivery): fusiona valores
-    if (!['admin','owner','delivery'].includes(String(role))) {
+    if (!['admin', 'owner', 'delivery'].includes(String(role))) {
       return res.status(400).json({ error: 'Rol inválido' })
     }
 
@@ -1555,7 +1600,7 @@ app.patch('/admin/customers/:id/role-owner', authenticateToken, requireAdmin, as
 
     return res.json(upd.rows[0])
   } catch (e) {
-    try { await pool.query('ROLLBACK') } catch {}
+    try { await pool.query('ROLLBACK') } catch { }
     console.error('PATCH /admin/customers/:id/role-owner', e)
     return res.status(500).json({ error: 'No se pudo actualizar role/owner_id' })
   }
@@ -1897,7 +1942,7 @@ app.get('/cart', authenticateToken, async (req, res) => {
 })
 
 // 🛒 Agregar/actualizar ítem en carrito (server calcula precio)
-app.post('/cart/add', authenticateToken, async (req, res) => { 
+app.post('/cart/add', authenticateToken, async (req, res) => {
   const customerId = req.user.id
   const { product_id, quantity } = req.body
 
