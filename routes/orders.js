@@ -431,18 +431,61 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
   }
 });
 
-// Cambiar estado admin
+// Cambiar estado admin (escribe timestamps)
 router.patch('/admin/orders/:id/status', authenticateToken, requireAdmin, async (req, res) => {
-  const { id } = req.params
-  const { status } = req.body
-  if (!status) return res.status(400).json({ error: 'status requerido' })
+  const { id } = req.params;
+  const { status } = req.body;
+  if (!status) return res.status(400).json({ error: 'status requerido' });
 
   try {
+    const next = String(status);
+
+    // Cuando marcamos shipped o delivered, guardamos timestamps
+    if (next === 'shipped' || next === 'delivered') {
+      const nowISO = new Date().toISOString();
+      const timeKey = next === 'shipped' ? 'shipped_at' : 'delivered_at';
+
+      const upd = await pool.query(
+        `UPDATE orders
+            SET status = $1,
+                metadata = COALESCE(metadata,'{}'::jsonb)
+                           || jsonb_build_object(
+                                'status_times',
+                                COALESCE(metadata->'status_times','{}'::jsonb)
+                                  || jsonb_build_object($2::text, $3::text)
+                              )
+                           || CASE WHEN $1 = 'delivered' THEN
+                                jsonb_build_object(
+                                  'delivery',
+                                  COALESCE(metadata->'delivery','{}'::jsonb)
+                                  || jsonb_build_object('delivered', true, 'delivered_at', $3::text)
+                                )
+                              ELSE '{}'::jsonb END
+          WHERE id = $4
+      RETURNING id, created_at, status, payment_method, total, metadata`,
+        [next, timeKey, nowISO, id]
+      );
+
+      if (!upd.rows.length) return res.status(404).send('Orden no encontrada');
+
+      const agg = await pool.query(
+        `SELECT COUNT(*)::int AS items_count,
+                COALESCE(SUM(quantity*unit_price),0) AS total_calc
+           FROM line_items
+          WHERE order_id = $1`,
+        [id]
+      );
+
+      return res.json({ ...upd.rows[0], ...agg.rows[0] });
+    }
+
+    // Otros estados: update simple
     const upd = await pool.query(
-      `UPDATE orders SET status = $1 WHERE id = $2 RETURNING id, created_at, status, payment_method, total`,
-      [status, id]
-    )
-    if (!upd.rows.length) return res.status(404).send('Orden no encontrada')
+      `UPDATE orders SET status = $1 WHERE id = $2
+       RETURNING id, created_at, status, payment_method, total, metadata`,
+      [next, id]
+    );
+    if (!upd.rows.length) return res.status(404).send('Orden no encontrada');
 
     const agg = await pool.query(
       `SELECT COUNT(*)::int AS items_count,
@@ -450,14 +493,15 @@ router.patch('/admin/orders/:id/status', authenticateToken, requireAdmin, async 
          FROM line_items
         WHERE order_id = $1`,
       [id]
-    )
+    );
 
-    res.json({ ...upd.rows[0], ...agg.rows[0] })
+    return res.json({ ...upd.rows[0], ...agg.rows[0] });
   } catch (e) {
-    console.error(e)
-    res.status(500).send('Error al actualizar estado')
+    console.error(e);
+    return res.status(500).send('Error al actualizar estado');
   }
-})
+});
+
 
 // Partner/Delivery panel
 router.get('/partner/orders', authenticateToken, requirePartnerOrAdmin, async (req, res) => {

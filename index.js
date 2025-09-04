@@ -9,7 +9,7 @@ const { ownersRouter, ownersPublicRouter } = require('./routes/owners')
 const ownerAreasRouter = require('./routes/ownerAreas')
 const shippingRouter = require('./routes/shipping')
 
-// NUEVOS routers por funcionalidad
+// routers por funcionalidad
 const productsRouter = require('./routes/products')
 const ordersRouter = require('./routes/orders')
 const categoriesRouter = require('./routes/categories')
@@ -88,8 +88,7 @@ app.use('/payments', paymentsRouter)                      // callback público
 app.use('/checkout-direct', checkoutDirectRoutes)
 app.use('/payments-direct', paymentsDirectRoutes)
 
-// === Montaje de routers nuevos por funcionalidad ===
-// Nota: se montan a nivel raíz porque cada archivo ya declara sus paths completos
+
 app.use(productsRouter)
 app.use(ordersRouter)
 app.use(categoriesRouter)
@@ -105,7 +104,7 @@ app.use('/admin/owners', authenticateToken, requireAdmin, ownersRouter);
 // Rutas de entrega
 app.use('/deliver', require('./routes/deliver'))
 
-// Limpieza automática de uploads (misma lógica)
+// Limpieza automática de uploads
 const RETENTION_DAYS = Number(process.env.DELIVERY_RETENTION_DAYS || 30);
 const CLEANUP_EVERY_HOURS = Number(process.env.DELIVERY_CLEANUP_EVERY_HOURS || 24);
 const DELETE_PREFIX = process.env.DELIVERY_CLEANUP_PREFIX || 'proof_';

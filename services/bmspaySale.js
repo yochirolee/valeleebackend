@@ -1,7 +1,7 @@
 // services/bmspaySale.js
 // Ejecuta una venta directa en BMSPAY (Transactions/Sale)
 // Usa x-www-form-urlencoded porque es lo que mejor compatibiliza con varios despliegues de BMS.
-// Si tu entorno requiere JSON, te dejo comentado al final cómo enviarlo en JSON.
+
 
 const { URLSearchParams } = require('url')
 
