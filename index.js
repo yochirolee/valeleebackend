@@ -1670,6 +1670,130 @@ app.get('/customers/:id', async (req, res) => {
   }
 })
 
+// === ACTUALIZAR PERFIL DEL PROPIO USUARIO ===
+app.put('/customers/me', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+
+  // Campos permitidos desde el front (no tocamos email aquí)
+  const {
+    first_name,
+    last_name,
+    phone,
+    address,
+    billing_zip, // opcional: lo guardamos en metadata.billing_zip
+    metadata,    // opcional: merge
+  } = req.body || {};
+
+  // Construimos SET dinámico
+  const sets = [];
+  const vals = [];
+  let i = 1;
+
+  if (typeof first_name !== 'undefined') { sets.push(`first_name = $${i++}`); vals.push(first_name); }
+  if (typeof last_name  !== 'undefined') { sets.push(`last_name  = $${i++}`); vals.push(last_name); }
+  if (typeof phone      !== 'undefined') { sets.push(`phone      = $${i++}`); vals.push(phone); }
+  if (typeof address    !== 'undefined') { sets.push(`address    = $${i++}`); vals.push(address); }
+
+  // merge metadata (billing_zip + extra)
+  const mdPatch = {};
+  if (typeof billing_zip === 'string' && billing_zip.trim() !== '') mdPatch.billing_zip = billing_zip.trim();
+  if (metadata && typeof metadata === 'object') Object.assign(mdPatch, metadata);
+
+  if (Object.keys(mdPatch).length > 0) {
+    sets.push(`metadata = COALESCE(metadata,'{}'::jsonb) || $${i++}::jsonb`);
+    vals.push(JSON.stringify(mdPatch));
+  }
+
+  if (sets.length === 0) {
+    return res.status(400).json({ ok: false, message: 'No hay campos para actualizar.' });
+  }
+
+  vals.push(userId);
+
+  try {
+    const q = `
+      UPDATE customers
+         SET ${sets.join(', ')}
+       WHERE id = $${i}
+   RETURNING id, email, first_name, last_name, phone, address, metadata
+    `;
+    const { rows } = await pool.query(q, vals);
+    if (!rows.length) return res.status(404).json({ ok: false, message: 'Cliente no encontrado' });
+    return res.json({ ok: true, customer: rows[0] });
+  } catch (e) {
+    console.error('PUT /customers/me', e);
+    return res.status(500).json({ ok: false, message: 'Error actualizando el perfil' });
+  }
+});
+
+// Compat: endpoint legacy admin/update by ID (no usar para password reset)
+app.put('/customers/:id', async (req, res) => {
+  const { id } = req.params;
+  if (id === 'me') return res.status(400).json({ ok: false, message: 'Usa PUT /customers/me' });
+  if (!/^\d+$/.test(String(id))) return res.status(400).json({ ok: false, message: 'ID inválido' });
+
+  // Campos legacy y actuales
+  let {
+    name,             // legacy: lo mapeamos a first/last
+    email,            // opcional (mejor restringir a admin en el futuro)
+    address,          // existe en tu tabla
+    payment_method,   // legacy: lo moveremos a metadata.payment_method
+    metadata,         // objeto opcional
+    first_name,       // actuales
+    last_name,
+    phone,            // si tu tabla lo tiene
+  } = req.body || {};
+
+  // Mapear `name` -> first_name / last_name si no vinieron explícitos
+  if (name && (!first_name && !last_name)) {
+    const parts = String(name).trim().split(/\s+/);
+    first_name = parts.shift() || '';
+    last_name = parts.join(' ') || '';
+  }
+
+  // Preparar patch de metadata (incluye payment_method si vino legacy)
+  const mdPatch = {};
+  if (payment_method) mdPatch.payment_method = String(payment_method);
+  if (metadata && typeof metadata === 'object') Object.assign(mdPatch, metadata);
+
+  // Construir SET dinámico solo con columnas reales
+  const sets = [];
+  const vals = [];
+  let i = 1;
+
+  if (typeof email      !== 'undefined') { sets.push(`email = $${i++}`);      vals.push(String(email).trim().toLowerCase()); }
+  if (typeof first_name !== 'undefined') { sets.push(`first_name = $${i++}`); vals.push(first_name); }
+  if (typeof last_name  !== 'undefined') { sets.push(`last_name  = $${i++}`); vals.push(last_name); }
+  if (typeof phone      !== 'undefined') { sets.push(`phone      = $${i++}`); vals.push(phone); }
+  if (typeof address    !== 'undefined') { sets.push(`address    = $${i++}`); vals.push(address); }
+  if (Object.keys(mdPatch).length > 0) {
+    sets.push(`metadata = COALESCE(metadata,'{}'::jsonb) || $${i++}::jsonb`);
+    vals.push(JSON.stringify(mdPatch));
+  }
+
+  if (sets.length === 0) {
+    return res.status(400).json({ ok: false, message: 'Nada para actualizar.' });
+  }
+
+  vals.push(Number(id));
+
+  try {
+    const q = `
+      UPDATE customers
+         SET ${sets.join(', ')}, updated_at = NOW()
+       WHERE id = $${i}
+   RETURNING id, email, first_name, last_name, phone, address, metadata
+    `;
+    const { rows } = await pool.query(q, vals);
+    if (!rows.length) return res.status(404).json({ ok: false, message: 'Cliente no encontrado' });
+    return res.json({ ok: true, customer: rows[0] });
+  } catch (error) {
+    console.error('PUT /customers/:id', error);
+    return res.status(500).json({ ok: false, message: 'Error al actualizar el cliente' });
+  }
+});
+
+/* Si verifico que no se usa, borrar
 app.put('/customers/:id', async (req, res) => {
   const { id } = req.params
   const { name, email, address, payment_method, metadata } = req.body
@@ -1687,7 +1811,7 @@ app.put('/customers/:id', async (req, res) => {
     console.error(error)
     res.status(500).send('Error al actualizar el cliente')
   }
-})
+}) */
 
 app.delete('/customers/:id', async (req, res) => {
   const { id } = req.params
