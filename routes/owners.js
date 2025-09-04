@@ -262,4 +262,100 @@ ownersRouter.delete('/:id', async (req, res) => {
   }
 });
 
+// ⚙️ Guardar shipping-config de un owner (ADMIN)
+// Ruta completa: PUT /admin/owners/:ownerId/shipping-config
+ownersRouter.put('/:ownerId/shipping-config', async (req, res) => {
+  const ownerId = Number(req.params.ownerId);
+  const cfg = req.body || {};
+
+  const cuRestrict = !!cfg.cu_restrict_to_list; // flag
+
+  const cuMode = (cfg.cu?.mode === 'by_weight') ? 'weight' : 'fixed';
+
+  const fixed = cfg.cu?.fixed || {};
+  const byW   = cfg.cu?.by_weight || {};
+  const base  = byW.base || {};
+
+  const usFixed = cfg.us?.fixed_usd ?? null;
+
+  const cuHabCityFlat   = fixed.habana_city ?? null;
+  const cuHabRuralFlat  = fixed.habana_municipio ?? null;
+  const cuOtherCityFlat = fixed.provincias_city ?? null;
+  const cuOtherRuralFlat= fixed.provincias_municipio ?? null;
+
+  const cuRatePerLb     = byW.rate_per_lb ?? null;
+  const cuHabCityBase   = base.habana_city ?? null;
+  const cuHabRuralBase  = base.habana_municipio ?? null;
+  const cuOtherCityBase = base.provincias_city ?? null;
+  const cuOtherRuralBase= base.provincias_municipio ?? null;
+
+  const cuMinFee        = cfg.cu?.min_fee ?? null;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // US: incluir mode='fixed' para satisfacer NOT NULL (si aplica)
+    await client.query(`
+      INSERT INTO owner_shipping_config (owner_id, country, active, mode, us_flat)
+      VALUES ($1, 'US', true, 'fixed', $2)
+      ON CONFLICT (owner_id, country) DO UPDATE
+        SET active = EXCLUDED.active,
+            mode   = EXCLUDED.mode,
+            us_flat= EXCLUDED.us_flat
+    `, [ownerId, usFixed]);
+
+    // CU (incluye el flag cu_restrict_to_list)
+    await client.query(`
+      INSERT INTO owner_shipping_config (
+        owner_id, country, active, mode,
+        cu_hab_city_flat,    cu_hab_rural_flat,
+        cu_other_city_flat,  cu_other_rural_flat,
+        cu_rate_per_lb,
+        cu_hab_city_base,    cu_hab_rural_base,
+        cu_other_city_base,  cu_other_rural_base,
+        cu_min_fee,
+        cu_restrict_to_list
+      )
+      VALUES ($1, 'CU', true, $2,
+              $3, $4, $5, $6,
+              $7,
+              $8, $9, $10, $11,
+              $12,
+              $13)
+      ON CONFLICT (owner_id, country) DO UPDATE SET
+        active = EXCLUDED.active,
+        mode   = EXCLUDED.mode,
+        cu_hab_city_flat    = EXCLUDED.cu_hab_city_flat,
+        cu_hab_rural_flat   = EXCLUDED.cu_hab_rural_flat,
+        cu_other_city_flat  = EXCLUDED.cu_other_city_flat,
+        cu_other_rural_flat = EXCLUDED.cu_other_rural_flat,
+        cu_rate_per_lb      = EXCLUDED.cu_rate_per_lb,
+        cu_hab_city_base    = EXCLUDED.cu_hab_city_base,
+        cu_hab_rural_base   = EXCLUDED.cu_hab_rural_base,
+        cu_other_city_base  = EXCLUDED.cu_other_city_base,
+        cu_other_rural_base = EXCLUDED.cu_other_rural_base,
+        cu_min_fee          = EXCLUDED.cu_min_fee,
+        cu_restrict_to_list = EXCLUDED.cu_restrict_to_list
+    `, [
+      ownerId, cuMode,
+      cuHabCityFlat, cuHabRuralFlat, cuOtherCityFlat, cuOtherRuralFlat,
+      cuRatePerLb,
+      cuHabCityBase, cuHabRuralBase, cuOtherCityBase, cuOtherRuralBase,
+      cuMinFee,
+      cuRestrict
+    ]);
+
+    await client.query('COMMIT');
+    return res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('PUT /admin/owners/:ownerId/shipping-config error', e);
+    return res.status(500).json({ error: 'No se pudo actualizar shipping_config' });
+  } finally {
+    client.release();
+  }
+});
+
+
 module.exports = { ownersRouter, ownersPublicRouter };
