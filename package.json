@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "nodemon index.js",
     "start": "node index.js",   
-    "build": "tsc || echo \"no TS build\"",
+    "build": "echo \"no TS build\"",
     "db:init": "node scripts/init-db.js"
   },
   "engines": {
