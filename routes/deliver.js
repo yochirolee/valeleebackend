@@ -6,7 +6,6 @@ const rateLimit = require('express-rate-limit');
 const { pool } = require('../db');
 const { verifyDeliveryToken } = require('../helpers/deliveryToken');
 const { uploadBufferToCloudinary } = require('../helpers/cloudinaryUpload');
-
 const router = express.Router();
 
 // === Config ===
@@ -33,6 +32,13 @@ const upload = multer({
 const confirmLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const partnerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 min
+  max: 120,                  // un poco más laxo para panel interno
   standardHeaders: true,
   legacyHeaders: false,
 });

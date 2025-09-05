@@ -4,6 +4,10 @@ const { pool } = require('../db')
 const authenticateToken = require('../middleware/authenticateToken')
 const { requireAdmin, isAdminUser, getUserRoleAndOwnerId, requirePartnerOrAdmin } = require('../middleware/roles')
 
+const multer = require('multer')
+const rateLimit = require('express-rate-limit')
+const { uploadBufferToCloudinary } = require('../helpers/cloudinaryUpload')
+
 const CARD_FEE_PCT_BACK = Number(process.env.CARD_FEE_PCT ?? '3');
 const CARD_FEE_RATE = Number.isFinite(CARD_FEE_PCT_BACK) ? CARD_FEE_PCT_BACK / 100 : 0;
 
@@ -504,6 +508,46 @@ router.patch('/admin/orders/:id/status', authenticateToken, requireAdmin, async 
 
 
 // Partner/Delivery panel
+
+const MAX_UPLOAD_MB = Number(process.env.DELIVERY_MAX_MB || 6)
+const ALLOWED_MIME = /^(image\/(jpe?g|png|webp|heic|heif))$/i
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    if (!ALLOWED_MIME.test(file?.mimetype || '')) {
+      const e = new Error('invalid_type'); e.code = 'LIMIT_FILE_TYPE'
+      return cb(e)
+    }
+    cb(null, true)
+  },
+})
+
+const partnerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+})
+
+// Helper para capturar errores de multer y responder bonito
+function handleUpload(field) {
+  return (req, res, next) => {
+    upload.single(field)(req, res, (err) => {
+      if (!err) return next()
+      if (err?.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ ok: false, message: `La imagen excede ${MAX_UPLOAD_MB} MB` })
+      }
+      if (err?.code === 'LIMIT_FILE_TYPE' || err?.message === 'invalid_type') {
+        return res.status(400).json({ ok: false, message: 'Formato no permitido. Usa JPG, PNG, WEBP o HEIC.' })
+      }
+      console.error('[multer] Error:', err)
+      return res.status(400).json({ ok: false, message: 'Error subiendo archivo' })
+    })
+  }
+}
+
 router.get('/partner/orders', authenticateToken, requirePartnerOrAdmin, async (req, res) => {
   try {
     const { role, owner_id } = await getUserRoleAndOwnerId(req.user.id)
@@ -673,6 +717,132 @@ router.patch('/partner/orders/:id/status', authenticateToken, requirePartnerOrAd
 
   return res.json({ ok: true, ...upd.rows[0] })
 })
+
+// POST /partner/orders/:id/mark-delivered
+// multipart/form-data: photo?, notes?, client_tx_id?
+router.post(
+  '/partner/orders/:id/mark-delivered',
+  authenticateToken,
+  requirePartnerOrAdmin,
+  partnerLimiter,
+  handleUpload('photo'),
+  
+  async (req, res) => {    
+    const id = Number(req.params.id)
+    if (!id) return res.status(400).json({ ok: false, message: 'orderId inválido' })
+
+    const client_tx_id = req.body?.client_tx_id || String(Date.now())
+    const notes = req.body?.notes || null
+
+    const userId = req.user.id
+    const { role, owner_id } = await getUserRoleAndOwnerId(userId)
+
+    // Lee orden y aplica EXACTAMENTE las mismas reglas que en /status:
+    const { rows } = await pool.query(
+      `SELECT id, owner_id, status, metadata FROM orders WHERE id=$1 LIMIT 1`,
+      [id]
+    )
+    if (!rows.length) return res.status(404).json({ ok: false, message: 'Orden no encontrada' })
+
+    const ord = rows[0]
+    const md = ord.metadata || {}
+    const current = String(ord.status)
+
+    // Reglas (calcadas de tu /status):
+    if (role === 'owner') {
+      if (!owner_id || Number(ord.owner_id) !== Number(owner_id)) {
+        return res.status(403).json({ ok: false, message: 'No autorizado' })
+      }
+      if (current !== 'shipped') {
+        return res.status(409).json({ ok: false, message: 'Para marcar delivered debe estar en shipped' })
+      }
+    } else if (role === 'delivery') {
+      if (String(md.delivery_assignee_id || '') !== String(userId)) {
+        return res.status(403).json({ ok: false, message: 'Orden no asignada a ti' })
+      }
+      if (current !== 'shipped') {
+        return res.status(409).json({ ok: false, message: 'Para marcar delivered debe estar en shipped' })
+      }
+    } else if (role !== 'admin') {
+      return res.status(403).json({ ok: false, message: 'No autorizado' })
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+
+      // Idempotencia de evento
+      await client.query(
+        `INSERT INTO delivery_events(order_id, client_tx_id, notes, photo_url)
+         VALUES ($1,$2,$3,NULL)
+         ON CONFLICT (order_id, client_tx_id) DO NOTHING`,
+        [id, client_tx_id, notes]
+      )
+
+      // Subida a Cloudinary (si hay foto)
+      let photoUrl = null
+      let photoPublicId = null
+      if (req.file) {
+        const publicId = `order_${id}_${client_tx_id}`
+        const up = await uploadBufferToCloudinary(req.file.buffer, {
+          public_id: publicId,
+          folder: process.env.CLOUDINARY_FOLDER || 'deliveries',
+        })
+        photoUrl = up.secure_url
+        photoPublicId = up.public_id
+
+        // actualiza el evento con la url
+        await client.query(
+          `UPDATE delivery_events SET photo_url = $3 WHERE order_id=$1 AND client_tx_id=$2`,
+          [id, client_tx_id, photoUrl]
+        )
+      }
+
+      // Parche de metadata (mantén tu estructura)
+      const nowISO = new Date().toISOString()
+      const newMeta = {
+        ...(md || {}),
+        status_times: {
+          ...(md?.status_times || {}),
+          delivered_at: nowISO,
+        },
+        delivery: {
+          ...(md?.delivery || {}),
+          delivered: true,
+          delivered_at: nowISO,
+          delivered_by: role === 'delivery' ? 'partner' : 'owner/admin',
+          notes: notes || null,
+          photo_url: photoUrl || null,
+          photo_public_id: photoPublicId || null,
+        },
+      }
+
+      // Update orden
+      const upd = await client.query(
+        `UPDATE orders
+            SET status = 'delivered',
+                metadata = $2::jsonb
+          WHERE id = $1
+          RETURNING id, status, metadata`,
+        [id, JSON.stringify(newMeta)]
+      )
+
+      await client.query('COMMIT')
+      return res.json({
+        ok: true,
+        ...upd.rows[0],
+        photo_url: photoUrl,
+        photo_public_id: photoPublicId,
+      })
+    } catch (e) {
+      await client.query('ROLLBACK')
+      console.error('[partner mark-delivered] error:', e?.code, e?.message || e)
+      return res.status(500).json({ ok: false, message: 'No se pudo marcar delivered' })
+    } finally {
+      client.release()
+    }
+  }
+)
 
 // Historial de órdenes por cliente (pública por path; en tu index estaba sin auth)
 router.get('/customers/:customerId/orders', authenticateToken, async (req, res) => {
