@@ -1,24 +1,19 @@
 const express = require('express');
-const multer = require('multer'); // para multipart (foto)
+const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const sharp = require('sharp');                    // 👈 nuevo
-const rateLimit = require('express-rate-limit');   // 👈 nuevo
+const rateLimit = require('express-rate-limit');
 const { pool } = require('../db');
 const { verifyDeliveryToken } = require('../helpers/deliveryToken');
+const { uploadBufferToCloudinary } = require('../helpers/cloudinaryUpload');
 
 const router = express.Router();
 
 // === Config ===
-const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(process.cwd(), 'uploads');
 const API_BASE = process.env.API_BASE_URL || 'http://localhost:4000';
-const PUBLIC_UPLOAD_BASE = process.env.PUBLIC_UPLOAD_BASE || `${API_BASE}/uploads`;
 
-const MAX_UPLOAD_MB = Number(process.env.DELIVERY_MAX_MB || 6); // 👈 6MB por defecto
+const MAX_UPLOAD_MB = Number(process.env.DELIVERY_MAX_MB || 6);
 const ALLOWED_MIME = /^(image\/(jpe?g|png|webp|heic|heif))$/i;
-
-// crea carpeta si no existe
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // === Multer en memoria + validaciones ===
 const upload = multer({
@@ -36,8 +31,8 @@ const upload = multer({
 
 // Rate limit básico para confirmar entrega
 const confirmLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 min
-  max: 60,                  // 60 req por IP
+  windowMs: 15 * 60 * 1000,
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -58,42 +53,6 @@ function isDelivered(meta) {
   return Boolean(meta && meta.delivery && meta.delivery.delivered === true);
 }
 
-function mimeToExt(m) {
-  const mm = String(m || '').toLowerCase();
-  if (mm.includes('jpeg') || mm.includes('jpg')) return '.jpg';
-  if (mm.includes('png')) return '.png';
-  if (mm.includes('webp')) return '.webp';
-  if (mm.includes('heic') || mm.includes('heif')) return '.heic';
-  return '.jpg';
-}
-
-// Procesa y guarda la foto (jpg optimizado). Si falla, guarda original.
-async function processAndSavePhoto(file) {
-  if (!file) return null;
-  const baseName = `proof_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-  const jpgName = `${baseName}.jpg`;
-  const jpgPath = path.join(UPLOAD_DIR, jpgName);
-
-  try {
-    await sharp(file.buffer)
-      .rotate() // respeta EXIF orientation
-      .resize({ width: 1600, withoutEnlargement: true, fit: 'inside' })
-      .jpeg({ quality: 78, mozjpeg: true })
-      .toFile(jpgPath);
-    return jpgName; // éxito como JPG
-  } catch (e) {
-    // fallback: guarda el buffer original con su extensión
-    const fallbackName = `${baseName}${mimeToExt(file.mimetype)}`;
-    const fallbackPath = path.join(UPLOAD_DIR, fallbackName);
-    try {
-      fs.writeFileSync(fallbackPath, file.buffer);
-      return fallbackName;
-    } catch {
-      throw e; // si también falla, propaga
-    }
-  }
-}
-
 // GET /deliver/:token → datos mínimos para el formulario
 router.get('/:token', async (req, res) => {
   try {
@@ -101,10 +60,7 @@ router.get('/:token', async (req, res) => {
     const ord = await getOrderById(decoded.order_id);
     if (!ord) return res.status(404).json({ ok: false, message: 'Orden no encontrada' });
 
-    // si ya está entregada → solo lectura
     const delivered = isDelivered(ord.metadata);
-
-    // info esencial para mostrar al mensajero
     const ship = ord.metadata?.shipping || {};
     return res.json({
       ok: true,
@@ -172,7 +128,7 @@ router.post(
     try {
       await client.query('BEGIN');
 
-      // 1) Idempotencia: si ya existe ese (order_id, client_tx_id) devolvemos 200
+      // 1) Idempotencia
       const existing = await client.query(
         `SELECT id FROM delivery_events WHERE order_id = $1 AND client_tx_id = $2 LIMIT 1`,
         [orderId, client_tx_id]
@@ -182,7 +138,7 @@ router.post(
         return res.json({ ok: true, order_id: orderId, repeated: true });
       }
 
-      // 2) Ver estado actual y bloquear fila
+      // 2) Estado actual
       const { rows: orows } = await client.query(
         `SELECT id, status, metadata FROM orders WHERE id = $1 FOR UPDATE`,
         [orderId]
@@ -194,22 +150,26 @@ router.post(
 
       const ord = orows[0];
       const meta = ord.metadata || {};
-
-      // Estados donde NO se permite marcar como entregada
       const forbiddenStates = new Set(['canceled', 'cancelled', 'failed', 'refunded']);
       if (forbiddenStates.has(String(ord.status || '').toLowerCase())) {
         await client.query('ROLLBACK');
         return res.status(409).json({ ok: false, message: 'La orden no puede entregarse en su estado actual' });
       }
 
-      // 3) Si hay foto, procesar y guardar AHORA (ya validamos estado)
+      // 3) Subir foto a Cloudinary
       let photoUrl = null;
+      let photoPublicId = null;
       if (req.file) {
-        const savedName = await processAndSavePhoto(req.file);
-        photoUrl = `${PUBLIC_UPLOAD_BASE}/${encodeURIComponent(savedName)}`;
+        const publicId = `order_${orderId}_${client_tx_id}`;
+        const up = await uploadBufferToCloudinary(req.file.buffer, {
+          public_id: publicId,
+          folder: process.env.CLOUDINARY_FOLDER || 'deliveries',
+        });
+        photoUrl = up.secure_url;
+        photoPublicId = up.public_id;
       }
 
-      // 4) Si ya estaba entregada, registra evento idempotente y sal
+      // 4) Si ya estaba entregada
       if (isDelivered(meta)) {
         await client.query(
           `INSERT INTO delivery_events(order_id, client_tx_id, notes, photo_url)
@@ -223,6 +183,7 @@ router.post(
           already_delivered: true,
           status: 'delivered',
           photo_url: photoUrl || null,
+          photo_public_id: photoPublicId || null,
         });
       }
 
@@ -233,14 +194,15 @@ router.post(
         [orderId, client_tx_id, notes || null, photoUrl || null]
       );
 
-      // 6) Marcar entregada en metadata y status
+      // 6) Marcar entregada (+ metadata con public_id)
       const deliveryPatch = {
         ...(meta.delivery || {}),
         delivered: true,
         delivered_at: new Date().toISOString(),
-        delivered_by: 'link', // o 'courier'
+        delivered_by: 'link',
         notes: notes || null,
         photo_url: photoUrl || null,
+        photo_public_id: photoPublicId || null,
       };
 
       await client.query(
@@ -253,7 +215,13 @@ router.post(
       );
 
       await client.query('COMMIT');
-      return res.json({ ok: true, order_id: orderId, status: 'delivered', photo_url: photoUrl || null });
+      return res.json({
+        ok: true,
+        order_id: orderId,
+        status: 'delivered',
+        photo_url: photoUrl || null,
+        photo_public_id: photoPublicId || null,
+      });
     } catch (e) {
       await client.query('ROLLBACK');
       console.error('[deliver.confirm] Error:', e?.code, e?.message || e);

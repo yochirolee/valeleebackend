@@ -104,37 +104,5 @@ app.use('/admin/owners', authenticateToken, requireAdmin, ownersRouter);
 // Rutas de entrega
 app.use('/deliver', require('./routes/deliver'))
 
-// Limpieza automática de uploads
-const RETENTION_DAYS = Number(process.env.DELIVERY_RETENTION_DAYS || 30);
-const CLEANUP_EVERY_HOURS = Number(process.env.DELIVERY_CLEANUP_EVERY_HOURS || 24);
-const DELETE_PREFIX = process.env.DELIVERY_CLEANUP_PREFIX || 'proof_';
-
-function cleanupUploads() {
-  const now = Date.now();
-  const maxAgeMs = RETENTION_DAYS * 24 * 60 * 60 * 1000;
-  let deleted = 0, kept = 0, errors = 0;
-  try {
-    const entries = fs.readdirSync(UPLOAD_DIR, { withFileTypes: true });
-    for (const ent of entries) {
-      if (!ent.isFile()) continue;
-      const name = ent.name;
-      if (name === '.gitkeep' || name === '.keep') { kept++; continue; }
-      if (DELETE_PREFIX && !name.startsWith(DELETE_PREFIX)) { kept++; continue; }
-      const full = path.join(UPLOAD_DIR, name);
-      try {
-        const stat = fs.statSync(full);
-        const ageMs = now - stat.mtimeMs;
-        if (ageMs > maxAgeMs) { fs.unlinkSync(full); deleted++; } else { kept++; }
-      } catch (e) { errors++; console.error('[cleanupUploads] No se pudo procesar', name, e?.message || e); }
-    }
-    console.log(`[cleanupUploads] OK — borrados=${deleted}, conservados=${kept}, días=${RETENTION_DAYS}`);
-  } catch (e) { console.error('[cleanupUploads] Falló el escaneo:', e?.message || e); }
-}
-const RUN_CLEANUP = String(process.env.RUN_UPLOAD_CLEANUP ?? 'true') === 'true';
-if (RUN_CLEANUP) {
-  setTimeout(cleanupUploads, 60 * 1000);
-  setInterval(cleanupUploads, CLEANUP_EVERY_HOURS * 60 * 60 * 1000);
-}
-
 const PORT_FINAL = process.env.PORT || 4000
 app.listen(PORT_FINAL, () => console.log(`Servidor escuchando en el puerto ${PORT_FINAL}`))
