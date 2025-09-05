@@ -35,6 +35,7 @@ const PORT = process.env.PORT || 4000
 const HOST = process.env.HOST || '0.0.0.0'
 
 const app = express()
+app.set('trust proxy', 1)
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
