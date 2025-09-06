@@ -9,7 +9,7 @@ const CARD_FEE_PCT = Number(process.env.CARD_FEE_PCT || process.env.NEXT_PUBLIC_
 const FEE_RATE = Number.isFinite(CARD_FEE_PCT) ? CARD_FEE_PCT / 100 : 0
 
 // Owner por defecto para “encargos”
-const ENCARGOS_OWNER_NAME  = (process.env.ENCARGOS_OWNER_NAME || 'valelee').trim()
+const ENCARGOS_OWNER_NAME = (process.env.ENCARGOS_OWNER_NAME || 'valelee').trim()
 const ENCARGOS_OWNER_EMAIL = (process.env.ENCARGOS_OWNER_EMAIL || '').trim() || null
 
 // ====================== HELPERS GENERALES ======================
@@ -31,10 +31,10 @@ function zoneKeyForCuba(province, area_type) {
 // ====================== HELPERS DE CAPTURA/RESOLVE ======================
 function detectSource(u) {
   try {
-    const h = new URL(u).hostname.replace(/^www\./,'').toLowerCase()
+    const h = new URL(u).hostname.replace(/^www\./, '').toLowerCase()
     if (h === 'a.co' || /(^|\.)amazon\./i.test(h)) return 'amazon'
     if (/(^|\.)shein\./i.test(h)) return 'shein'
-  } catch {}
+  } catch { }
   return 'unknown'
 }
 
@@ -59,13 +59,16 @@ function extractAsinFromUrl(u) {
   } catch { return null }
 }
 
-const pick = (re, html) => (html.match(re)?.[1] || '').trim() || null
+const pick = (re, html) => {
+  const m = html.match(re)
+  return m && m[1] ? String(m[1]).trim() : null
+}
 
 function tryTitle(html) {
   return (
+    pick(/<span[^>]+id=['"]productTitle['"][^>]*>\s*([^<]+)\s*<\/span>/i, html) ||
     pick(/<meta[^>]+property=['"]og:title['"][^>]*content=['"]([^"']+)['"]/i, html) ||
-    (pick(/<title>([^<]+)<\/title>/i, html)?.replace(/\s+Amazon\.com.*$/i, '').trim() || null) ||
-    pick(/<span[^>]+id=['"]productTitle['"][^>]*>\s*([^<]+)\s*<\/span>/i, html)
+    (pick(/<title>([^<]+)<\/title>/i, html)?.replace(/\s+Amazon\.com.*$/i, '').trim() || null)
   )
 }
 
@@ -78,13 +81,7 @@ function tryImage(html) {
   )
 }
 
-function tryPrice(html) {
-  return (
-    pick(/<span[^>]+class=['"][^"']*a-offscreen[^"']*['"][^>]*>\s*([$€£]\s?\d[\d,\.]*)\s*<\/span>/i, html) ||
-    pick(/id=['"]priceblock_(?:ourprice|dealprice)['"][^>]*>\s*([$€£]\s?\d[\d,\.]*)/i, html) ||
-    pick(/data-a-color=['"]price['"][\s\S]*?class=['"][^"']*a-offscreen[^"']*['"][^>]*>\s*([$€£]\s?\d[\d,\.]*)/i, html)
-  )
-}
+
 
 // Normaliza "$1,234.56" o "1.234,56" -> 1234.56
 function toNumberOrNull(raw) {
@@ -245,19 +242,19 @@ async function computeEncargosShipping(client, shipping) {
     if (modeRaw === 'fixed') {
       mode = 'fixed'
       const usd =
-        zoneKey === 'habana_city'          ? Number(cfg.cu_hab_city_flat || 0) :
-        zoneKey === 'habana_municipio'     ? Number(cfg.cu_hab_rural_flat || 0) :
-        zoneKey === 'provincias_city'      ? Number(cfg.cu_other_city_flat || 0) :
-        zoneKey === 'provincias_municipio' ? Number(cfg.cu_other_rural_flat || 0) : 0
+        zoneKey === 'habana_city' ? Number(cfg.cu_hab_city_flat || 0) :
+          zoneKey === 'habana_municipio' ? Number(cfg.cu_hab_rural_flat || 0) :
+            zoneKey === 'provincias_city' ? Number(cfg.cu_other_city_flat || 0) :
+              zoneKey === 'provincias_municipio' ? Number(cfg.cu_other_rural_flat || 0) : 0
       cents = toCents(usd)
     } else {
       mode = 'by_weight'
       const rate = Number(cfg.cu_rate_per_lb || 0)
       const base =
-        zoneKey === 'habana_city'          ? Number(cfg.cu_hab_city_base || 0) :
-        zoneKey === 'habana_municipio'     ? Number(cfg.cu_hab_rural_base || 0) :
-        zoneKey === 'provincias_city'      ? Number(cfg.cu_other_city_base || 0) :
-        zoneKey === 'provincias_municipio' ? Number(cfg.cu_other_rural_base || 0) : 0
+        zoneKey === 'habana_city' ? Number(cfg.cu_hab_city_base || 0) :
+          zoneKey === 'habana_municipio' ? Number(cfg.cu_hab_rural_base || 0) :
+            zoneKey === 'provincias_city' ? Number(cfg.cu_other_city_base || 0) :
+              zoneKey === 'provincias_municipio' ? Number(cfg.cu_other_rural_base || 0) : 0
 
       const minFee = Number(cfg.cu_min_fee || 0)
       const usd = base + rate * (Number(weightLb) || 0)
@@ -280,56 +277,360 @@ async function computeEncargosShipping(client, shipping) {
   }
 }
 
-// ====================== ENDPOINTS ======================
+// routes/encargos.resolve.js
+// Requiere Node 18+ (tiene fetch global). En Node <18 instala `node-fetch` y haz: const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args))
 
-// ---- POST /encargos/resolve (sin auth) ----
+// ========= Helpers =========
+
+
+function normalizePriceDisplayed(value, currencyHint) {
+  if (value == null) return null
+  const s = String(value).trim()
+  if (!s) return null
+
+  // si ya viene con símbolo + dígitos, respétalo
+  if (/[$€£]\s*\d/.test(s)) return s
+
+  let num = s.replace(/[^\d.,-]/g, '')
+  const hasDot = num.includes('.')
+  const hasComma = num.includes(',')
+
+  if (hasDot && hasComma && /,\d{2}$/.test(num)) {
+    // 1.234,56 -> 1234.56
+    num = num.replace(/\./g, '').replace(',', '.')
+  } else if (hasComma && !hasDot) {
+    // 1234,56 -> 1234.56
+    num = num.replace(',', '.')
+  } else {
+    // 1,234.56 -> 1234.56
+    num = num.replace(/,/g, '')
+  }
+
+  const n = Number(num)
+  if (!Number.isFinite(n)) return s
+
+  const cur = (currencyHint || 'USD').toUpperCase()
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: cur }).format(n)
+  } catch {
+    const sym = cur === 'EUR' ? '€' : cur === 'GBP' ? '£' : '$'
+    return `${sym}${n.toFixed(2)}`
+  }
+}
+
+function detectSource(u) {
+  try {
+    const h = new URL(u).hostname.toLowerCase()
+    if (h.includes('amazon.')) return 'amazon'
+    if (h.includes('shein.')) return 'shein'
+    return 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+function extractAsinFromUrl(u) {
+  try {
+    const url = new URL(u)
+    const m1 = url.pathname.match(/\/(?:dp|gp\/product|gp\/aw\/d|-\s*\/dp)\/([A-Z0-9]{10})(?:[/?]|$)/i)
+    if (m1 && m1[1]) return m1[1].toUpperCase()
+    const asinParam = url.searchParams.get('asin')
+    if (asinParam && /^[A-Z0-9]{10}$/i.test(asinParam)) return asinParam.toUpperCase()
+    return null
+  } catch {
+    return null
+  }
+}
+
+function tryImage(html) {
+  const dyn =
+    pick(/id=["']landingImage["'][^>]*\sdata-a-dynamic-image=["']([^"']+)["']/i, html) ||
+    pick(/data-a-dynamic-image=["']([^"']+)["'][^>]*id=["']landingImage["']/i, html) ||
+    pick(/class=["'][^"']*imgTagWrapper[^"']*["'][\s\S]*?data-a-dynamic-image=["']([^"']+)["']/i, html)
+
+  if (dyn) {
+    try {
+      const json = JSON.parse(dyn.replace(/&quot;/g, '"'))
+      const urls = Object.keys(json || {})
+      if (urls.length) {
+        urls.sort((a, b) => (json[b]?.[0] || 0) - (json[a]?.[0] || 0))
+        return urls[0]
+      }
+    } catch { }
+  }
+
+  return (
+    pick(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i, html) ||
+    pick(/<img[^>]+id=["']landingImage["'][^>]*\ssrc=["']([^"']+)["']/i, html) ||
+    null
+  )
+}
+
+function tryPrice(html) {
+  const currencyHint =
+    pick(/<meta\s+itemprop=["']priceCurrency["']\s+content=["']([A-Z]{3})["']/i, html) ||
+    pick(/"priceCurrency"\s*:\s*"([A-Z]{3})"/i, html) ||
+    pick(/"currencyCode"\s*:\s*"([A-Z]{3})"/i, html) ||
+    undefined
+
+  // 0) JSON embebido “to pay”
+  const p2pJson =
+    pick(/"apexPriceToPay"[\s\S]*?"displayPrice"\s*:\s*"([^"]+)"/i, html) ||
+    pick(/"priceToPay"[\s\S]*?"displayPrice"\s*:\s*"([^"]+)"/i, html) ||
+    pick(/"currentPrice"[\s\S]*?"priceString"\s*:\s*"([^"]+)"/i, html)
+  if (p2pJson) {
+    const norm = normalizePriceDisplayed(p2pJson, currencyHint)
+    console.log('[tryPrice] JSON priceToPay/currentPrice:', p2pJson, '=>', norm)
+    if (norm) return norm
+  }
+
+  // 0.b) Otros JSON modernos (rebajado)
+  const jsonOpt =
+    pick(/"buyingOptionSectionData"[\s\S]*?"priceAmount"\s*:\s*"([^"]+)"/i, html) ||
+    pick(/"priceInfo"[\s\S]*?"finalPrice"[\s\S]*?"amount"\s*:\s*"([^"]+)"/i, html)
+  if (jsonOpt) {
+    const norm = normalizePriceDisplayed(jsonOpt, currencyHint)
+    console.log('[tryPrice] JSON buyingOption/priceInfo:', jsonOpt, '=>', norm)
+    if (norm) return norm
+  }
+
+  // 1) corePriceDisplay_...
+  const coreBlock = html.match(/id=["']corePriceDisplay_[^"']*["'][\s\S]{0,2500}?<\/span>/i)
+  if (coreBlock && coreBlock[0]) {
+    const off = pick(/class=["'][^"']*a-offscreen[^"']*["'][^>]*>([^<]+)<\/span>/i, coreBlock[0])
+    if (off) {
+      const norm = normalizePriceDisplayed(off, currencyHint)
+      console.log('[tryPrice] corePriceDisplay a-offscreen:', off, '=>', norm)
+      if (norm) return norm
+    }
+    // aria-hidden dentro del core
+    const hidden = coreBlock[0].match(/<span[^>]*aria-hidden=["']true["'][^>]*>([\s\S]*?)<\/span>/i)
+    if (hidden && hidden[1]) {
+      let txt = hidden[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
+      txt = txt.replace(/\s*\.\s*/g, '.')
+      const mnum = txt.match(/([$€£]?\s*\d[\d,]*([.]\d{2})?)/)
+      if (mnum) {
+        const norm = normalizePriceDisplayed(mnum[0], currencyHint)
+        console.log('[tryPrice] corePriceDisplay aria-hidden:', txt, '=>', norm)
+        if (norm) return norm
+      }
+    }
+  }
+
+  // 2) Bloques .a-price (excluye list price)
+  const priceBlocks = [...html.matchAll(/<span[^>]*class=["'][^"']*a-price[^"']*["'][^>]*>([\s\S]*?)<\/span>/ig)]
+  for (const m of priceBlocks) {
+    const block = m[0]
+    if (/a-text-price/.test(block)) continue
+
+    // 2.a) a-offscreen directo
+    const off = pick(/class=["'][^"']*a-offscreen[^"']*["'][^>]*>([^<]+)<\/span>/i, block)
+    if (off) {
+      const norm = normalizePriceDisplayed(off, currencyHint)
+      console.log('[tryPrice] a-price a-offscreen:', off, '=>', norm)
+      if (norm) return norm
+    }
+
+    // 2.b) aria-hidden “compuesto”
+    const hiddenMatch = block.match(/<span[^>]*aria-hidden=["']true["'][^>]*>([\s\S]*?)<\/span>/i)
+    if (hiddenMatch && hiddenMatch[1]) {
+      let txt = hiddenMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
+      txt = txt.replace(/\s*\.\s*/g, '.')
+      const mnum = txt.match(/([$€£]?\s*\d[\d,]*([.]\d{2})?)/)
+      if (mnum) {
+        const norm = normalizePriceDisplayed(mnum[0], currencyHint)
+        console.log('[tryPrice] a-price aria-hidden:', txt, '=>', norm)
+        if (norm) return norm
+      } else {
+        console.log('[tryPrice] a-price aria-hidden (sin número claro):', txt)
+      }
+    }
+
+    // 2.c) whole + fraction (clásico)
+    const whole = pick(/class=["'][^"']*a-price-whole[^"']*["'][^>]*>([^<]+)</i, block)
+    const frac  = pick(/class=["'][^"']*a-price-fraction[^"']*["'][^>]*>([^<]+)</i, block)
+    if (whole) {
+      const raw = `${whole.replace(/[^\d.,]/g, '')}${frac ? '.' + String(frac).replace(/[^\d]/g, '') : ''}`
+      const norm = normalizePriceDisplayed(frac ? raw : whole + '.00', currencyHint)
+      console.log('[tryPrice] a-price whole/fraction:', whole, frac, '=>', norm)
+      if (norm) return norm
+    }
+  }
+
+  // 3) Legacy ids
+  const legacyIds = ['priceblock_dealprice', 'priceblock_saleprice', 'priceblock_ourprice']
+  for (const id of legacyIds) {
+    const p = pick(new RegExp(`id=["']${id}["'][^>]*>([\\s\\S]*?)<`, 'i'), html)
+    if (p) {
+      const norm = normalizePriceDisplayed(p, currencyHint)
+      console.log('[tryPrice] legacy id', id, ':', p, '=>', norm)
+      if (norm) return norm
+    }
+  }
+
+  // 4) Fallback global .a-offscreen
+  const anyOff = pick(/class=["'][^"']*a-offscreen[^"']*["'][^>]*>([^<]+)<\/span>/i, html)
+  if (anyOff) {
+    const norm = normalizePriceDisplayed(anyOff, currencyHint)
+    console.log('[tryPrice] fallback a-offscreen:', anyOff, '=>', norm)
+    if (norm) return norm
+  }
+
+  // 5) Microdata itemprop=price
+  const itemProp = pick(/itemprop=["']price["'][^>]*content=["']([^"']+)["']/i, html)
+  if (itemProp) {
+    const norm = normalizePriceDisplayed(itemProp, currencyHint)
+    console.log('[tryPrice] microdata itemprop=price:', itemProp, '=>', norm)
+    if (norm) return norm
+  }
+
+  console.log('[tryPrice] no price found')
+  return null
+}
+
+
+
+function tryCompareAtPrice(html) {
+  const currencyHint =
+    pick(/<meta\s+itemprop=["']priceCurrency["']\s+content=["']([A-Z]{3})["']/i, html) ||
+    pick(/"priceCurrency"\s*:\s*"([A-Z]{3})"/i, html) ||
+    pick(/"currencyCode"\s*:\s*"([A-Z]{3})"/i, html) ||
+    undefined
+
+  // 1) Bloque a-text-price (list price tachado)
+  const block = html.match(/<span[^>]*class=["'][^"']*a-price[^"']*a-text-price[^"']*["'][^>]*>([\s\S]*?)<\/span>/i)
+  if (block && block[0]) {
+    const off = pick(/class=["'][^"']*a-offscreen[^"']*["'][^>]*>([^<]+)<\/span>/i, block[0])
+    if (off) {
+      console.log('[tryCompareAtPrice] a-text-price offscreen:', off)
+      const norm = normalizePriceDisplayed(off, currencyHint)
+      if (norm) return norm
+    }
+    // Whole + fraction en el bloque tachado
+    const whole = pick(/class=["'][^"']*a-price-whole[^"']*["'][^>]*>([^<]+)</i, block[0])
+    const frac = pick(/class=["'][^"']*a-price-fraction[^"']*["'][^>]*>([^<]+)</i, block[0])
+    if (whole) {
+      const composed = `${whole.replace(/[^\d.,]/g, '')}.${(frac || '00').replace(/[^\d]/g, '').padStart(2, '0')}`
+      console.log('[tryCompareAtPrice] a-text-price whole/fraction:', composed)
+      const norm = normalizePriceDisplayed(composed, currencyHint)
+      if (norm) return norm
+    }
+  }
+
+  // 2) JSON: listPrice / wasPrice / rrp / regularPrice
+  const jsonList =
+    pick(/"listPrice"\s*:\s*"([0-9][0-9.,]*)"/i, html) ||
+    pick(/"wasPrice"\s*:\s*"([0-9][0-9.,]*)"/i, html) ||
+    pick(/"rrp"\s*:\s*"([0-9][0-9.,]*)"/i, html) ||
+    pick(/"regularPrice"\s*:\s*"([0-9][0-9.,]*)"/i, html)
+  if (jsonList) {
+    console.log('[tryCompareAtPrice] JSON list/was/rrp:', jsonList)
+    const norm = normalizePriceDisplayed(jsonList, currencyHint)
+    if (norm) return norm
+  }
+
+  // 3) Legacy id (raro)
+  const legacy = pick(/id=["']priceblock_ourprice["'][^>]*>([\s\S]*?)</i, html)
+  if (legacy) {
+    console.log('[tryCompareAtPrice] legacy ourprice:', legacy)
+    const norm = normalizePriceDisplayed(legacy, currencyHint)
+    if (norm) return norm
+  }
+
+  console.log('[tryCompareAtPrice] no compare-at found')
+  return null
+}
+
+
+
+// ========= Endpoint =========
 router.post('/resolve', async (req, res) => {
   try {
     const { url } = req.body || {}
-    if (!url) return res.status(400).json({ ok: false, error: 'url_required' })
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ ok: false, error: 'url_required' })
+    }
 
     const headers = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-      'Accept-Language': 'en-US,en;q=0.9,es-ES;q=0.8,es;q=0.7',
+      'Accept-Language': 'en-US,en;q=0.9',
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
       'Cache-Control': 'no-cache',
       'Pragma': 'no-cache',
     }
 
-    const r = await fetch(url, { redirect: 'follow', headers })
-    const finalUrl = r.url || url
+    const resp = await fetch(url, { redirect: 'follow', headers })
+    const finalUrl = resp.url || url
     const source = detectSource(finalUrl)
 
     let html = ''
-    const ct = r.headers.get('content-type') || ''
-    if (ct.includes('text/html')) html = await r.text()
+    const ct = resp.headers.get('content-type') || ''
+    if (ct.includes('text/html')) {
+      html = await resp.text()
+      // a veces Amazon codifica &quot; en atributos JSON
+      html = html.replace(/&amp;quot;/g, '&quot;')
+    }
 
-    let external_id = null, title = null, image = null, price = null
+    let external_id = null
+    let title = null
+    let image = null
+    let price = null
+    let currency = 'USD'
+    let compare_at_price = null
 
     if (source === 'amazon') {
       const asinFromUrl = extractAsinFromUrl(finalUrl)
-      const asinFromHtml = html.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/i)?.[1]
+      const asinFromHtmlMatch = html.match(/\/(?:dp|gp\/product|gp\/aw\/d)\/([A-Z0-9]{10})/i)
+      const asinFromHtml = asinFromHtmlMatch && asinFromHtmlMatch[1] ? asinFromHtmlMatch[1] : null
       external_id = (asinFromUrl || asinFromHtml || '').toUpperCase() || null
+
       title = html ? tryTitle(html) : null
       image = html ? tryImage(html) : null
       price = html ? tryPrice(html) : null
+      compare_at_price = html ? tryCompareAtPrice(html) : null
+
+      currency =
+        pick(/<meta\s+itemprop=["']priceCurrency["']\s+content=["']([A-Z]{3})["']/i, html) ||
+        pick(/"priceCurrency"\s*:\s*"([A-Z]{3})"/i, html) ||
+        pick(/"currencyCode"\s*:\s*"([A-Z]{3})"/i, html) ||
+        'USD'
     } else if (source === 'shein') {
-      external_id = extractSheinIdFromUrl(finalUrl)
-                || html.match(/"goods_id"\s*:\s*"?(\d{6,})"?/i)?.[1]
-                || null
-      title = pick(/<meta[^>]+property=['"]og:title['"][^>]*content=['"]([^"']+)['"]/i, html)
-           || pick(/<title>([^<]+)<\/title>/i, html)
+      external_id = extractSheinIdFromUrl(finalUrl) ||
+        pick(/"goods_id"\s*:\s*"?(\d{6,})"?/i, html) ||
+        null
+
+      title =
+        pick(/<meta[^>]+property=['"]og:title['"][^>]*content=['"]([^"']+)['"]/i, html) ||
+        pick(/<title>([^<]+)<\/title>/i, html)
       image = pick(/<meta[^>]+property=['"]og:image['"][^>]*content=['"]([^"']+)['"]/i, html)
-      price = pick(/<meta[^>]+property=['"]product:price:amount['"][^>]*content=['"]([^"']+)['"]/i, html)
-           || (html.match(/"retailPrice"\s*:\s*"?([\d\.,]+)"?/i)?.[1] || null)
+
+      const sheinPrice =
+        pick(/<meta[^>]+property=['"]product:price:amount['"][^>]*content=['"]([^"']+)['"]/i, html) ||
+        pick(/"retailPrice"\s*:\s*"?([\d\.,]+)"?/i, html)
+      price = normalizePriceDisplayed(sheinPrice, 'USD')
+      currency = 'USD'
     } else {
-      title = pick(/<meta[^>]+property=['"]og:title['"][^>]*content=['"]([^"']+)['"]/i, html)
-           || pick(/<title>([^<]+)<\/title>/i, html)
+      title =
+        pick(/<meta[^>]+property=['"]og:title['"][^>]*content=['"]([^"']+)['"]/i, html) ||
+        pick(/<title>([^<]+)<\/title>/i, html)
       image = pick(/<meta[^>]+property=['"]og:image['"][^>]*content=['"]([^"']+)['"]/i, html)
     }
-    const asin = (source === 'amazon') ? external_id : null
-    return res.json({ ok: true, source, finalUrl, external_id, asin, title, image, price })
-  } catch {
+
+    const asin = source === 'amazon' ? external_id : null
+
+    return res.json({
+      ok: true,
+      source,
+      finalUrl,
+      external_id,
+      asin,
+      title,
+      image,
+      price,
+      compare_at_price,
+      currency,
+    })
+  } catch (e) {
     return res.status(400).json({ ok: false, error: 'resolve_failed' })
   }
 })
