@@ -159,11 +159,13 @@ router.get('/orders/:id/detail', authenticateToken, async (req, res) => {
     const isAdmin = await isAdminUser(req.user.id);
     if (!isOwner && !isAdmin) return res.sendStatus(403);
 
+    // ⬇️ Cambio: COALESCE a metadata para cubrir items de Encargos (sin product_id)
     const { rows: items } = await pool.query(
       `SELECT
          li.product_id,
-         p.title  AS product_name,
-         p.image_url,
+         COALESCE(p.title,       li.metadata->>'title')      AS product_name,
+         COALESCE(p.image_url,   li.metadata->>'image_url')  AS image_url,
+         li.metadata->>'source_url'                          AS source_url,
          li.quantity,
          li.unit_price
        FROM line_items li
@@ -192,6 +194,7 @@ router.get('/orders/:id/detail', authenticateToken, async (req, res) => {
         product_id: it.product_id,
         product_name: it.product_name || undefined,
         image_url: it.image_url || null,
+        source_url: it.source_url || null, // opcional para UI
         quantity: Number(it.quantity),
         unit_price: Number(it.unit_price),
       })),
@@ -200,7 +203,8 @@ router.get('/orders/:id/detail', authenticateToken, async (req, res) => {
     console.error('GET /orders/:id/detail error', e);
     return res.status(500).send('Error al obtener detalle de orden');
   }
-})
+});
+
 
 // ADMIN ORDERS: listado con cálculos
 router.get('/admin/orders', authenticateToken, requireAdmin, async (req, res) => {
@@ -373,17 +377,19 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
     const o = headRows[0];
 
     const { rows: itemRows } = await pool.query(`
-      SELECT
-        li.product_id,
-        p.title AS product_name,
-        p.image_url,
-        li.quantity,
-        li.unit_price
-      FROM line_items li
-      LEFT JOIN products p ON p.id = li.product_id
-      WHERE li.order_id = $1
-      ORDER BY li.id ASC
-    `, [id]);
+            SELECT
+              li.product_id,
+              COALESCE(p.title,      li.metadata->>'title')     AS product_name,
+              COALESCE(p.image_url,  li.metadata->>'image_url') AS image_url,
+              li.metadata->>'source_url'                        AS source_url,
+              li.metadata->>'external_id'                       AS external_id,
+              li.quantity,
+              li.unit_price
+            FROM line_items li
+            LEFT JOIN products p ON p.id = li.product_id
+            WHERE li.order_id = $1
+            ORDER BY li.id ASC
+          `, [id]);
 
     const subtotalCalc = itemRows.reduce((acc, it) => acc + Number(it.quantity) * Number(it.unit_price), 0)
     const snapSubtotal = Number(o.metadata?.pricing?.subtotal ?? o.metadata?.payment?.subtotal)
@@ -422,9 +428,11 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
         metadata: o.metadata || {},
       },
       items: itemRows.map(it => ({
-        product_id: it.product_id,
-        product_name: it.product_name || undefined,
+        product_id: it.product_id,                        // puede ser null en encargos
+        product_name: it.product_name || 'Encargo',
         image_url: it.image_url || null,
+        source_url: it.source_url || null,
+        external_id: it.external_id || null,
         quantity: Number(it.quantity),
         unit_price: Number(it.unit_price),
       })),
@@ -726,8 +734,8 @@ router.post(
   requirePartnerOrAdmin,
   partnerLimiter,
   handleUpload('photo'),
-  
-  async (req, res) => {    
+
+  async (req, res) => {
     const id = Number(req.params.id)
     if (!id) return res.status(400).json({ ok: false, message: 'orderId inválido' })
 
@@ -844,32 +852,48 @@ router.post(
   }
 )
 
-// Historial de órdenes por cliente (pública por path; en tu index estaba sin auth)
+// Historial de órdenes por cliente (autenticado: sólo el propio usuario o admin)
 router.get('/customers/:customerId/orders', authenticateToken, async (req, res) => {
-  const { customerId } = req.params
+  const customerId = Number(req.params.customerId);
+  if (!Number.isFinite(customerId)) {
+    return res.status(400).json({ error: 'customerId inválido' });
+  }
+
   try {
+    // Seguridad: solo la misma usuaria o admin
+    const isAdmin = await isAdminUser(req.user.id);
+    if (Number(req.user.id) !== customerId && !isAdmin) {
+      return res.sendStatus(403);
+    }
+
     const ordersResult = await pool.query(
-      `SELECT 
-         o.id AS order_id,
-         o.created_at,
-         o.status,              
-         o.payment_method,
-         o.metadata,
-         li.product_id,
-         li.quantity,
-         li.unit_price,
-         p.title AS product_name,
-         p.weight,
-         p.image_url
-       FROM orders o
-       JOIN line_items li ON o.id = li.order_id
-       JOIN products p ON li.product_id = p.id
-       WHERE o.customer_id = $1
-       ORDER BY o.created_at DESC`,
+      `
+      SELECT
+        o.id AS order_id,
+        o.created_at,
+        o.status,
+        o.payment_method,
+        o.metadata,
+
+        li.product_id,
+        li.quantity,
+        li.unit_price,
+
+        -- para encargos (sin product_id), leemos del metadata del line_item
+        COALESCE(p.title,     li.metadata->>'title')      AS product_name,
+        COALESCE(p.image_url, li.metadata->>'image_url')  AS image_url,
+        li.metadata->>'source_url'                         AS source_url
+      FROM orders o
+      JOIN line_items li         ON o.id = li.order_id
+      LEFT JOIN products  p      ON p.id = li.product_id    -- ⬅️ LEFT JOIN para incluir encargos
+      WHERE o.customer_id = $1
+      ORDER BY o.created_at DESC, li.id ASC
+      `,
       [customerId]
-    )
-    const rows = ordersResult.rows
-    const grouped = {}
+    );
+
+    const rows = ordersResult.rows;
+    const grouped = {};
     for (const row of rows) {
       if (!grouped[row.order_id]) {
         grouped[row.order_id] = {
@@ -879,24 +903,25 @@ router.get('/customers/:customerId/orders', authenticateToken, async (req, res) 
           payment_method: row.payment_method,
           metadata: row.metadata,
           items: [],
-        }
+        };
       }
       grouped[row.order_id].items.push({
-        product_id: row.product_id,
-        product_name: row.product_name,
-        quantity: row.quantity,
-        unit_price: row.unit_price,
-        weight: row.weight,
-        image_url: row.image_url,
-      })
+        product_id: row.product_id,                   // puede ser null en encargos
+        product_name: row.product_name || undefined,  // viene de COALESCE(...)
+        quantity: Number(row.quantity),
+        unit_price: Number(row.unit_price),
+        image_url: row.image_url || null,
+        source_url: row.source_url || null,           // opcional para enlazar al origen
+      });
     }
-    const result = Object.values(grouped)
-    res.json(result)
+
+    res.json(Object.values(grouped));
   } catch (error) {
-    console.error(error)
-    res.status(500).send('Error al obtener el historial de órdenes')
+    console.error('GET /customers/:customerId/orders error', error);
+    res.status(500).send('Error al obtener el historial de órdenes');
   }
-})
+});
+
 
 /* LINE ITEMS (tal cual estaban) */
 router.get('/line-items', authenticateToken, async (_req, res) => {

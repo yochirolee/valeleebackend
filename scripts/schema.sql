@@ -156,6 +156,22 @@ CREATE TABLE IF NOT EXISTS delivery_events (
   UNIQUE(order_id, client_tx_id)
 );
 
+CREATE TABLE IF NOT EXISTS pending_encargos (
+  id SERIAL PRIMARY KEY,
+  customer_id INTEGER NULL,
+  asin VARCHAR(20) NULL,
+  source_url TEXT NULL,
+  title TEXT NULL,
+  image_url TEXT NULL,
+  price_estimate NUMERIC(12,2) NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+ALTER TABLE pending_encargos
+  ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'amazon',
+  ADD COLUMN IF NOT EXISTS external_id TEXT NULL,
+  ADD COLUMN IF NOT EXISTS currency CHAR(3) DEFAULT 'USD'; 
+
 -- ==========================================================
 -- Asegurar compatibilidad con BD que ya existía (columnas/FKs)
 -- ==========================================================

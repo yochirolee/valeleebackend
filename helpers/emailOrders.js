@@ -25,6 +25,26 @@ const nonce = () => Math.random().toString(36).slice(2, 10);
 
 // ===== Helpers =====
 
+function thumb64Html(src, alt) {
+  const url = toAbsoluteUrl(src);
+  if (!url) {
+    return `<div style="width:64px;height:64px;border:1px solid #eee;border-radius:6px;background:#f8f8f8;"></div>`;
+  }
+  return `
+    <table role="presentation" cellpadding="0" cellspacing="0" width="64" height="64"
+           style="border-collapse:collapse;width:64px;height:64px;background:#ffffff;border:1px solid #eee;border-radius:6px;">
+      <tr>
+        <td align="center" valign="middle" style="width:64px;height:64px;line-height:0;">
+          <img src="${esc(url)}" alt="${esc(alt || '')}"
+               style="display:block;border:0;outline:none;text-decoration:none;
+                      max-width:64px;max-height:64px;width:auto;height:auto;border-radius:6px;" />
+        </td>
+      </tr>
+    </table>
+  `;
+}
+
+
 // Escapa texto para inyectar de forma segura en HTML
 function esc(s) {
   return String(s || '')
@@ -153,9 +173,7 @@ function renderCustomerHTML(order, items) {
     return `
       <tr>
         <td style="padding:6px 0;width:64px;vertical-align:top;">
-          ${img
-            ? `<img src="${esc(img)}" alt="${esc(name)}" width="64" height="64" style="display:block;border-radius:6px;" />`
-            : `<div style="width:64px;height:64px;border:1px solid #eee;border-radius:6px;background:#f8f8f8;"></div>`}
+        ${thumb64Html(it.image_url, name)}
         </td>
         <td style="padding:6px 0 6px 10px;vertical-align:top;">
           <div style="font-size:14px;font-weight:500;margin:0 0 2px 0;">${esc(name)}</div>
@@ -245,9 +263,7 @@ function renderOwnerHTML(order, items) {
     return `
       <tr>
         <td style="padding:6px 0;width:64px;vertical-align:top;">
-          ${img
-            ? `<img src="${esc(img)}" alt="${esc(name)}" width="64" height="64" style="display:block;border-radius:6px;" />`
-            : `<div style="width:64px;height:64px;border:1px solid #eee;border-radius:6px;background:#f8f8f8;"></div>`}
+        ${thumb64Html(it.image_url, name)}
         </td>
         <td style="padding:6px 0 6px 10px;vertical-align:top;">
           <div style="font-size:14px;font-weight:500;margin:0 0 2px 0;">${esc(name)} · x${qty}</div>

@@ -4,6 +4,9 @@ const { pool } = require('./db')
 const fs = require('fs')
 const path = require('path')
 const cors = require('cors')
+const encargosRouter = require('./routes/encargos')
+const encargosCheckoutRoutes = require('./routes/encargosCheckout')
+const paymentsDirectEncargos = require('./routes/payments_direct_encargos')
 
 const { ownersRouter, ownersPublicRouter } = require('./routes/owners')
 const ownerAreasRouter = require('./routes/ownerAreas')
@@ -104,6 +107,11 @@ app.use('/shipping', authenticateToken, shippingRouter)
 app.use('/admin/owners', authenticateToken, requireAdmin, ownersRouter);
 // Rutas de entrega
 app.use('/deliver', require('./routes/deliver'))
+
+//Encargos
+app.use('/encargos', encargosRouter)
+app.use('/encargos', encargosCheckoutRoutes)
+app.use('/payments-direct', paymentsDirectEncargos)
 
 const PORT_FINAL = process.env.PORT || 4000
 app.listen(PORT_FINAL, () => console.log(`Servidor escuchando en el puerto ${PORT_FINAL}`))
