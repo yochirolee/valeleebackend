@@ -205,8 +205,7 @@ router.get('/orders/:id/detail', authenticateToken, async (req, res) => {
   }
 });
 
-
-// ADMIN ORDERS: listado con cálculos
+// ADMIN ORDERS: listado con cálculos 
 router.get('/admin/orders', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const {
@@ -312,36 +311,8 @@ router.get('/admin/orders', authenticateToken, requireAdmin, async (req, res) =>
     const { rows } = await pool.query(sql, vals);
     const total = rows[0]?.total_rows ? Number(rows[0].total_rows) : 0;
 
-    const items = rows.map(r => {
-      const subtotal = Number(r.snap_subtotal ?? r.subtotal_calc ?? 0);
-      const tax = Number(r.snap_tax ?? 0);
-      const base_total =
-        Number(
-          (r.snap_total != null ? r.snap_total
-            : (subtotal + tax) || r.total_col || r.subtotal_calc
-          ) || 0
-        );
-
-      const card_fee = Math.round((base_total * CARD_FEE_RATE) * 100) / 100;
-      const total_with_fee = Math.round((base_total + card_fee) * 100) / 100;
-
-      return {
-        id: r.id,
-        created_at: r.created_at,
-        status: r.status,
-        payment_method: r.payment_method,
-        customer_id: r.customer_id,
-        email: r.email,
-        first_name: r.first_name,
-        last_name: r.last_name,
-        items_count: Number(r.items_count || 0),
-        subtotal: Number.isFinite(subtotal) ? subtotal : 0,
-        tax: Number.isFinite(tax) ? tax : 0,
-        base_total: Number.isFinite(base_total) ? base_total : 0,
-        card_fee,
-        total_with_fee,
-      };
-    });
+    // ====== CAMBIO: normalizar por metadata para no duplicar fee ======
+    const items = rows.map((r) => normalizeListRow(r));
 
     res.json({
       items,
@@ -357,6 +328,82 @@ router.get('/admin/orders', authenticateToken, requireAdmin, async (req, res) =>
   }
 });
 
+// ---- Helpers locales para /admin/orders ----
+function round2(x) { return Math.round(Number(x) * 100) / 100; }
+function isNum(x) { return typeof x === 'number' && Number.isFinite(x); }
+function num(x, d = 0) { const n = Number(x); return Number.isFinite(n) ? n : d; }
+
+function parseMd(mdRaw) {
+  if (!mdRaw) return null;
+  if (typeof mdRaw === 'string') {
+    try { return JSON.parse(mdRaw); } catch { return null; }
+  }
+  if (typeof mdRaw === 'object') return mdRaw;
+  return null;
+}
+
+/** Deriva montos SIN duplicar fee para el listado */
+function normalizeListRow(r) {
+  const md = parseMd(r.metadata);
+  const pc = md?.pricing_cents;   // centavos (fuente de verdad si existe)
+  const snap = md?.pricing;        // snapshot (USD)
+
+  let subtotal = 0, tax = 0, shipping = 0, base_total = 0, card_fee = 0, total_with_fee = 0;
+
+  if (pc) {
+    subtotal = num(pc.subtotal_cents, 0) / 100;
+    tax      = num(pc.tax_cents, 0) / 100;
+    shipping = num(pc.shipping_total_cents, 0) / 100;
+    card_fee = num(pc.card_fee_cents, 0) / 100;
+    base_total = round2(subtotal + tax + shipping);
+    total_with_fee = pc.total_with_card_cents != null
+      ? round2(num(pc.total_with_card_cents) / 100)
+      : round2(base_total + card_fee);
+  } else if (isNum(snap?.total) && isNum(snap?.card_fee)) {
+    // En encargos, snap.total ya incluye fee
+    subtotal = round2(num(snap.subtotal));
+    tax      = round2(num(snap.tax));
+    shipping = round2(num(snap.shipping));
+    total_with_fee = round2(num(snap.total));
+    card_fee = round2(num(snap.card_fee));
+    base_total = round2(total_with_fee - card_fee);
+  } else if (isNum(r.total_with_fee) && isNum(r.card_fee)) {
+    // Si ya existen columnas top-level coherentes
+    subtotal = round2(num(r.snap_subtotal ?? r.subtotal_calc));
+    tax      = round2(num(r.snap_tax));
+    total_with_fee = round2(num(r.total_with_fee));
+    card_fee = round2(num(r.card_fee));
+    base_total = round2(total_with_fee - card_fee);
+  } else {
+    // Fallback: recomputar desde componentes disponibles
+    subtotal = round2(num(r.snap_subtotal ?? r.subtotal_calc));
+    tax      = round2(num(r.snap_tax));
+    const shippingFallback = 0; // no está seleccionado en el CTE
+    base_total = round2(subtotal + tax + shippingFallback);
+    card_fee = round2(base_total * (CARD_FEE_RATE ?? 0.03));
+    total_with_fee = round2(base_total + card_fee);
+  }
+
+  return {
+    id: r.id,
+    created_at: r.created_at,
+    status: r.status,
+    payment_method: r.payment_method,
+    customer_id: r.customer_id,
+    email: r.email,
+    first_name: r.first_name,
+    last_name: r.last_name,
+    items_count: Number(r.items_count || 0),
+    subtotal,
+    tax,
+    base_total,
+    card_fee,
+    total_with_fee,
+  };
+}
+
+
+// Detalle admin
 // Detalle admin
 router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (req, res) => {
   try {
@@ -399,14 +446,42 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
     const subtotal = Number.isFinite(snapSubtotal) ? snapSubtotal : subtotalCalc
     const tax = Number.isFinite(snapTax) ? snapTax : 0
 
-    let base_total;
-    if (Number.isFinite(snapTotal)) base_total = snapTotal;
-    else if (Number.isFinite(subtotal + tax)) base_total = subtotal + tax;
-    else if (Number.isFinite(Number(o.total))) base_total = Number(o.total);
-    else base_total = subtotalCalc;
+    // ====== CAMBIO: cálculo robusto usando metadata.pricing_cents / pricing ======
+    const md = o.metadata || {};
+    const pc = md?.pricing_cents;
 
-    const card_fee = Math.round(base_total * CARD_FEE_RATE * 100) / 100;
-    const total_with_fee = Math.round((base_total + card_fee) * 100) / 100;
+    let base_total;
+    let card_fee;
+    let total_with_fee;
+
+    if (pc) {
+      const sub = Number((pc.subtotal_cents ?? 0) / 100);
+      const tx  = Number((pc.tax_cents ?? 0) / 100);
+      const shp = Number((pc.shipping_total_cents ?? 0) / 100);
+      const fee = Number((pc.card_fee_cents ?? 0) / 100);
+      const twc = pc.total_with_card_cents != null ? Number(pc.total_with_card_cents) / 100 : null;
+
+      base_total = Math.round((sub + tx + shp) * 100) / 100;
+      card_fee = Math.round(fee * 100) / 100;
+      total_with_fee = twc != null
+        ? Math.round(twc * 100) / 100
+        : Math.round((base_total + card_fee) * 100) / 100;
+    } else {
+      const snap = md?.pricing;
+      if (typeof snap?.total === 'number' && typeof snap?.card_fee === 'number') {
+        // En snapshot, total ya incluye fee
+        const twc = Number(snap.total);
+        const fee = Number(snap.card_fee);
+        base_total = Math.round((twc - fee) * 100) / 100;
+        card_fee = Math.round(fee * 100) / 100;
+        total_with_fee = Math.round(twc * 100) / 100;
+      } else {
+        // Último recurso: subtotal + tax (+ shipping si lo tuvieras) y fee %
+        base_total = Math.round((subtotal + tax) * 100) / 100;
+        card_fee = Math.round(base_total * (CARD_FEE_RATE ?? 0.03) * 100) / 100;
+        total_with_fee = Math.round((base_total + card_fee) * 100) / 100;
+      }
+    }
 
     res.json({
       order: {
@@ -421,6 +496,7 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
           phone: o.phone || null,
           address: o.address || null,
         },
+        // 'total' aquí es el total SIN fee (coherente con el frontend "correcto")
         pricing: { subtotal, tax, total: base_total },
         card_fee_pct: CARD_FEE_PCT_BACK,
         card_fee,
