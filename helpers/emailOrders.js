@@ -272,7 +272,7 @@ function renderCustomerHTML(order, items) {
             <tr>
               <!-- Columna izquierda (siempre primero) -->
               <td class="stack" style="vertical-align:middle;">
-                <div style="font-size:14px;line-height:1.4;color:#6F6F6F;">Estado de la orden</div>
+                <div style="font-size:14px;line-height:1.4;color:#6F6F6F;">Orden</div>
                 <div style="margin-top:6px;">${pill(safeStatus(order.status) || 'pagada')}</div>
               </td>
               <!-- Columna derecha: botón (derecha en desktop, centrado y debajo en móvil) -->
