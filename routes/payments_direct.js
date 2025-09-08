@@ -121,12 +121,24 @@ function buildCoverageError({ province, municipality, unavailable }) {
 // Igual que en el flujo por link, para poblar emails
 async function loadOrderDetail(orderId) {
   const headQ = `
-    SELECT o.id, o.created_at, o.status, o.metadata,
-           c.email AS customer_email, c.first_name, c.last_name
-      FROM orders o
-      LEFT JOIN customers c ON c.id = o.customer_id
-     WHERE o.id = $1
-     LIMIT 1
+    SELECT
+      o.id,
+      o.created_at,
+      o.status,
+      o.metadata,
+      o.owner_id,
+      c.email        AS customer_email,
+      c.first_name   AS customer_first_name,
+      c.last_name    AS customer_last_name,
+      ow.name        AS owner_name,
+      ow.email       AS owner_email,
+      ow.phone       AS owner_phone,
+      ow.metadata    AS owner_metadata
+    FROM orders o
+    LEFT JOIN customers c ON c.id = o.customer_id
+    LEFT JOIN owners    ow ON ow.id = o.owner_id
+    WHERE o.id = $1
+    LIMIT 1
   `;
   const { rows: hr } = await pool.query(headQ, [orderId]);
   if (!hr.length) return null;
@@ -466,10 +478,10 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           const { order: ord, items } = detail;
 
           const customerEmail =
-                      (ord.customer_email && String(ord.customer_email).trim()) ||
-                     (ord.metadata?.billing?.email && String(ord.metadata.billing.email).trim()) ||
-                     (ord.metadata?.shipping?.email && String(ord.metadata.shipping.email).trim()) ||
-                    null;
+            (ord.customer_email && String(ord.customer_email).trim()) ||
+            (ord.metadata?.billing?.email && String(ord.metadata.billing.email).trim()) ||
+            (ord.metadata?.shipping?.email && String(ord.metadata.shipping.email).trim()) ||
+            null;
 
           const ownerEmailRaw = (Array.isArray(items) && items.find(x => x.owner_email)?.owner_email) || null;
           const ownerEmail = ownerEmailRaw ? String(ownerEmailRaw).trim() : null;
@@ -486,15 +498,19 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           } else {
             console.warn(`[emails] Cliente sin email para orden #${oid}`);
           }
-          if (ownerEmail) {
-            tasks.push(
-              sendOwnerOrderEmail(ownerEmail, { ...ord, _subjectSuffix: subjectSuffix, _emailRole: 'owner' }, items)
-                .then(() => console.log(`[emails] OK owner ${ownerEmail} → orden #${oid}`))
-                .catch(e => console.error(`[emails] FAIL owner ${ownerEmail} → orden #${oid}`, e))
-            );
-          } else {
-            console.warn(`[emails] Owner sin email para orden #${oid}`);
-          }
+          tasks.push(
+            sendOwnerOrderEmail(
+              ownerEmail, // puede ser null/undefined; el helper cae a ADMIN_EMAILS
+              { ...ord, _subjectSuffix: subjectSuffix, _emailRole: 'owner' },
+              items
+            )
+              .then(() => {
+                const who = ownerEmail || (process.env.ADMIN_EMAILS || 'admin');
+                console.log(`[emails] OK owner-copy ${who} → orden #${oid}`);
+              })
+              .catch(e => console.error(`[emails] FAIL owner-copy → orden #${oid}`, e))
+          );
+
 
           await Promise.allSettled(tasks);
           await delay(1800);

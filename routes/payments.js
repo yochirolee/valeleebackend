@@ -9,12 +9,24 @@ const { sendCustomerOrderEmail, sendOwnerOrderEmail } = require('../helpers/emai
 async function loadOrderDetail(orderId) {
   // usamos pool directo (nuevo client) para no depender del que ya cerraste con COMMIT
   const headQ = `
-    SELECT o.id, o.created_at, o.status, o.metadata,
-           c.email AS customer_email, c.first_name, c.last_name
-      FROM orders o
-      LEFT JOIN customers c ON c.id = o.customer_id
-     WHERE o.id = $1
-     LIMIT 1
+    SELECT
+      o.id,
+      o.created_at,
+     o.status,
+      o.metadata,
+      o.owner_id,
+      c.email        AS customer_email,
+      c.first_name   AS customer_first_name,
+      c.last_name    AS customer_last_name,
+      ow.name        AS owner_name,
+      ow.email       AS owner_email,
+      ow.phone       AS owner_phone,
+      ow.metadata    AS owner_metadata
+    FROM orders o
+    LEFT JOIN customers c ON c.id = o.customer_id
+    LEFT JOIN owners    ow ON ow.id = o.owner_id
+    WHERE o.id = $1
+    LIMIT 1
   `;
   const { rows: hr } = await pool.query(headQ, [orderId]);
   if (!hr.length) return null;
@@ -227,7 +239,7 @@ router.get('/bmspay/confirm/:sessionId', async (req, res) => {
         // Emails destino (trim/normalize)
         const customerEmail =
           (ord.customer_email && String(ord.customer_email).trim()) ||
-         (ord.metadata?.billing?.email && String(ord.metadata.billing.email).trim()) ||
+          (ord.metadata?.billing?.email && String(ord.metadata.billing.email).trim()) ||
           (ord.metadata?.shipping?.email && String(ord.metadata.shipping.email).trim()) ||
           null;
 
@@ -252,15 +264,13 @@ router.get('/bmspay/confirm/:sessionId', async (req, res) => {
           console.warn(`[emails] Cliente sin email para orden #${oid}`);
         }
 
-        if (ownerEmail) {
-          tasks.push(
-            sendOwnerOrderEmail(ownerEmail, { ...ord, _subjectSuffix: subjectSuffix, _emailRole: 'owner' }, items)
-              .then(() => console.log(`[emails] OK owner ${ownerEmail} → orden #${oid}`))
-              .catch(e => console.error(`[emails] FAIL owner ${ownerEmail} → orden #${oid}`, e))
-          );
-        } else {
-          console.warn(`[emails] Owner sin email para orden #${oid}`);
-        }
+        // Enviar SIEMPRE. Si ownerEmail es null, el helper lo envía a ADMIN_EMAILS (TO) y,
+        // si existe ownerEmail, manda BCC a ADMIN_EMAILS evitando duplicados.
+        tasks.push(
+          sendOwnerOrderEmail(ownerEmail, { ...ord, _subjectSuffix: subjectSuffix, _emailRole: 'owner' }, items)
+            .then(() => console.log(`[emails] OK owner-copy ${ownerEmail || '(admins)'} → orden #${oid}`))
+            .catch(e => console.error(`[emails] FAIL owner-copy → orden #${oid}`, e))
+        );
 
         await Promise.allSettled(tasks);
         await delay(1800); // pequeño respiro
