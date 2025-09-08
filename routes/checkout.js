@@ -114,7 +114,7 @@ router.post('/:cartId', async (req, res) => {
     const sessionId = sessionQ.rows[0].id;
 
     // Payment Link (invoiceNumber = sessionId)
-    const FRONT_URL = process.env.CLIENT_ORIGIN || 'http://localhost:3000';
+    const FRONT_URL = process.env.CLIENT_BASE_URL || 'http://localhost:3000';
     const loc = (metadata && metadata.locale) ? `/${metadata.locale}` : '';
     const returnUrl = `${FRONT_URL}${loc}/checkout/success?sessionId=${sessionId}`;
 
