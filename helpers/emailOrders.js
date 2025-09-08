@@ -268,19 +268,16 @@ function renderCustomerHTML(order, items) {
     <tr>
       <td style="padding:8px 24px 0 24px;">
         <div style="background:#F7F7F7;border-radius:8px;padding:16px 16px;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+            <table role="presentation" width="100%">
             <tr>
-              <!-- Columna izquierda (siempre primero) -->
-              <td class="stack" style="vertical-align:middle;">
-                <div style="font-size:14px;line-height:1.4;color:#6F6F6F;">Orden</div>
+            <td>
+                <div style="font-size:14px;color:#6F6F6F;">Estado de la orden</div>
                 <div style="margin-top:6px;">${pill(safeStatus(order.status) || 'pagada')}</div>
-              </td>
-              <!-- Columna derecha: botón (derecha en desktop, centrado y debajo en móvil) -->
-              <td class="stack mobile-center pt-10" align="right" style="vertical-align:middle;">
-                ${button(orderUrl, 'Ver mi orden', 'secondary')}
-              </td>
+            </td>
+            <td align="right"> ${button(orderUrl, 'Ver mi orden', 'secondary')}
+            </td>            
             </tr>
-          </table>
+          </table>          
         </div>
       </td>
     </tr>
