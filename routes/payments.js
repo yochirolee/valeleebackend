@@ -159,7 +159,7 @@ router.get('/bmspay/confirm/:sessionId', async (req, res) => {
           ownerTotal,
           JSON.stringify({
             session_id: s.id,
-            shipping: address,
+            shipping: { country, ...address },
             billing: orderMeta.billing || null,
             terms: orderMeta.terms || undefined,
             payer: orderMeta.payer || undefined,

@@ -387,7 +387,7 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           ownerTotal,
           JSON.stringify({
             checkout_session_id: s.id,
-            shipping,
+            shipping: { country, ...shipping },
             billing: orderMeta.billing || null,
             terms: orderMeta.terms || undefined,
             payer: orderMeta.payer || undefined,
