@@ -7,7 +7,7 @@ const cors = require('cors')
 const encargosRouter = require('./routes/encargos')
 const encargosCheckoutRoutes = require('./routes/encargosCheckout')
 const paymentsDirectEncargos = require('./routes/payments_direct_encargos')
-
+const adminReportsRouter = require('./routes/admin_reports')
 const { ownersRouter, ownersPublicRouter } = require('./routes/owners')
 const ownerAreasRouter = require('./routes/ownerAreas')
 const shippingRouter = require('./routes/shipping')
@@ -101,10 +101,11 @@ app.use(cartRouter)
 
 // === Owners / Shipping ya existentes ===
 app.use('/owners', ownersPublicRouter)                                 // público: /owners/options
-app.use('/admin/owners', authenticateToken, ownersRouter)              // admin CRUD
-app.use('/admin/owners/:ownerId/areas', authenticateToken, ownerAreasRouter)
+app.use('/admin/owners/:ownerId/areas', authenticateToken, requireAdmin, ownerAreasRouter)
 app.use('/shipping', authenticateToken, shippingRouter)
 app.use('/admin/owners', authenticateToken, requireAdmin, ownersRouter);
+app.use('/admin/reports', adminReportsRouter);
+app.use('/admin/orders', authenticateToken, adminReportsRouter);
 // Rutas de entrega
 app.use('/deliver', require('./routes/deliver'))
 

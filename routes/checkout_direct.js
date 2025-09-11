@@ -5,7 +5,7 @@ const { pool } = require('../db');
 
 const router = express.Router();
 
-const JWT_SECRET = process.env.JWT_SECRET || 'secret';
+const JWT_SECRET = process.env.JWT_SECRET;
 
 // % fee para tarjeta
 const CARD_FEE_PCT = Number(process.env.CARD_FEE_PCT ?? '3');

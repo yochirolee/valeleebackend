@@ -25,6 +25,7 @@ router.post('/admin/categories', authenticateToken, requireAdmin, async (req, re
     )
     res.status(201).json(rows[0])
   } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'slug ya existe' })
     console.error(e); res.status(500).send('Error al crear categoría')
   }
 })
@@ -54,7 +55,10 @@ router.delete('/admin/categories/:id', authenticateToken, requireAdmin, async (r
     if (!rowCount) return res.status(404).send('Categoría no encontrada')
     res.sendStatus(204)
   } catch (e) {
-    console.error(e); res.status(500).send('Error al eliminar categoría (puede tener productos)')
+    if (e.code === '23503') {
+      return res.status(409).json({ error: 'No se puede eliminar: hay productos en esta categoría' })
+    }
+    console.error(e); res.status(500).send('Error al eliminar categoría')
   }
 })
 

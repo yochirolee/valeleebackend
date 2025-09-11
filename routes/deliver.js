@@ -9,7 +9,7 @@ const { uploadBufferToCloudinary } = require('../helpers/cloudinaryUpload');
 const router = express.Router();
 
 // === Config ===
-const API_BASE = process.env.API_BASE_URL || 'http://localhost:4000';
+const API_BASE = process.env.API_BASE_URL;
 
 const MAX_UPLOAD_MB = Number(process.env.DELIVERY_MAX_MB || 6);
 const ALLOWED_MIME = /^(image\/(jpe?g|png|webp|heic|heif))$/i;
@@ -111,6 +111,8 @@ function handleUpload(field) {
 
 // POST /deliver/confirm
 // Campos: token, client_tx_id, notes, photo (multipart)
+// POST /deliver/confirm
+// Campos: token, client_tx_id, notes, photo (multipart)
 router.post(
   '/confirm',
   confirmLimiter,
@@ -134,7 +136,7 @@ router.post(
     try {
       await client.query('BEGIN');
 
-      // 1) Idempotencia
+      // 1) Idempotencia de evento
       const existing = await client.query(
         `SELECT id FROM delivery_events WHERE order_id = $1 AND client_tx_id = $2 LIMIT 1`,
         [orderId, client_tx_id]
@@ -144,9 +146,9 @@ router.post(
         return res.json({ ok: true, order_id: orderId, repeated: true });
       }
 
-      // 2) Estado actual
+      // 2) Estado actual (lock para evitar carreras)
       const { rows: orows } = await client.query(
-        `SELECT id, status, metadata FROM orders WHERE id = $1 FOR UPDATE`,
+        `SELECT id, status, metadata, delivered_at FROM orders WHERE id = $1 FOR UPDATE`,
         [orderId]
       );
       if (!orows.length) {
@@ -156,13 +158,9 @@ router.post(
 
       const ord = orows[0];
       const meta = ord.metadata || {};
-      const forbiddenStates = new Set(['canceled', 'cancelled', 'failed', 'refunded']);
-      if (forbiddenStates.has(String(ord.status || '').toLowerCase())) {
-        await client.query('ROLLBACK');
-        return res.status(409).json({ ok: false, message: 'La orden no puede entregarse en su estado actual' });
-      }
+      const nowISO = new Date().toISOString();
 
-      // 3) Subir foto a Cloudinary
+      // 3) Subir foto a Cloudinary (si hay)
       let photoUrl = null;
       let photoPublicId = null;
       if (req.file) {
@@ -175,13 +173,29 @@ router.post(
         photoPublicId = up.public_id;
       }
 
-      // 4) Si ya estaba entregada
-      if (isDelivered(meta)) {
+      // 4) Si YA estaba entregada (por metadata), backfillear delivered_at + status_times si faltara
+      if (Boolean(meta?.delivery?.delivered === true)) {
+        const deliveredISO = meta?.delivery?.delivered_at || nowISO;
+
+        await client.query(
+          `UPDATE orders
+              SET delivered_at = COALESCE(delivered_at, $2::timestamptz),
+                  metadata = COALESCE(metadata,'{}'::jsonb)
+                           || jsonb_build_object(
+                                'status_times',
+                                COALESCE(metadata->'status_times','{}'::jsonb)
+                                  || jsonb_build_object('delivered_at', $2::text)
+                              )
+            WHERE id = $1`,
+          [orderId, deliveredISO]
+        );
+
         await client.query(
           `INSERT INTO delivery_events(order_id, client_tx_id, notes, photo_url)
            VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
           [orderId, client_tx_id, notes || null, photoUrl || null]
         );
+
         await client.query('COMMIT');
         return res.json({
           ok: true,
@@ -193,31 +207,44 @@ router.post(
         });
       }
 
-      // 5) Guardar evento
+      // 5) Guardar evento (nuevo)
       await client.query(
         `INSERT INTO delivery_events(order_id, client_tx_id, notes, photo_url)
          VALUES ($1,$2,$3,$4)`,
         [orderId, client_tx_id, notes || null, photoUrl || null]
       );
 
-      // 6) Marcar entregada (+ metadata con public_id)
+      // 6) Marcar entregada AHORA:
+      //    - status = delivered
+      //    - columna delivered_at (COALESCE por si ya estaba)
+      //    - metadata.status_times.delivered_at
+      //    - metadata.delivery {...}
       const deliveryPatch = {
         ...(meta.delivery || {}),
         delivered: true,
-        delivered_at: new Date().toISOString(),
+        delivered_at: nowISO,
         delivered_by: 'link',
         notes: notes || null,
         photo_url: photoUrl || null,
         photo_public_id: photoPublicId || null,
       };
+      const newMeta = {
+        ...(meta || {}),
+        status_times: {
+          ...(meta?.status_times || {}),
+          delivered_at: nowISO,
+        },
+        delivery: deliveryPatch,
+      };
 
       await client.query(
         `UPDATE orders
             SET status = 'delivered',
-                metadata = COALESCE(metadata,'{}'::jsonb)
-                          || jsonb_build_object('delivery', $2::jsonb)
-          WHERE id = $1`,
-        [orderId, JSON.stringify(deliveryPatch)]
+                delivered_at = COALESCE(delivered_at, $3::timestamptz),
+                metadata = $2::jsonb
+          WHERE id = $1
+          RETURNING id, status, delivered_at, metadata`,
+        [orderId, JSON.stringify(newMeta), nowISO]
       );
 
       await client.query('COMMIT');
@@ -237,5 +264,6 @@ router.post(
     }
   }
 );
+
 
 module.exports = router;

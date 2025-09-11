@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../db');
+const authenticateToken = require('../middleware/authenticateToken');
 
 // Helpers zonificación Cuba
 function zoneKeyForCuba(province, area_type) {
@@ -18,7 +19,7 @@ function toCents(usd) {
 }
 
 // POST /shipping/quote  { cartId, shipping: {...} }
-router.post('/quote', async (req, res) => {
+router.post('/quote', authenticateToken, async (req, res) => {
   const { cartId, shipping } = req.body || {};
   if (!cartId || !shipping || !shipping.country) {
     return res.status(400).json({ ok: false, message: 'cartId y shipping.country son requeridos' });

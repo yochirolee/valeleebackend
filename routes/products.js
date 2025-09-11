@@ -9,7 +9,6 @@ const { zoneKeyForCuba } = require('../utils/geo')
 router.get('/products', async (req, res) => {
   const {
     category_id,
-    include_archived,
     country,
     province,
     area_type,
@@ -19,24 +18,20 @@ router.get('/products', async (req, res) => {
   try {
     const where = [];
     const params = [];
-
-    if (!include_archived) {
-      where.push(`COALESCE(
-        CASE
-          WHEN jsonb_typeof(metadata->'archived') = 'boolean'
-            THEN (metadata->>'archived')::boolean
-          WHEN jsonb_typeof(metadata->'archived') = 'string'
-            THEN lower(metadata->>'archived') IN ('true','t','yes','1')
-          ELSE false
-        END
-      , false) = false`);
-    }
+    where.push(`COALESCE(
+    CASE
+      WHEN jsonb_typeof(metadata->'archived') = 'boolean'
+        THEN (metadata->>'archived')::boolean
+      WHEN jsonb_typeof(metadata->'archived') = 'string'
+        THEN lower(metadata->>'archived') IN ('true','t','yes','1')
+      ELSE false
+    END
+  , false) = false`);
 
     if (category_id) {
       params.push(Number(category_id));
       where.push(`category_id = $${params.length}`);
     }
-
     const countryNorm = String(country || '').toUpperCase();
     const prov = String(province || '').trim();
     const mun = String(municipality || req.query.municipio || '').trim();
@@ -70,7 +65,7 @@ router.get('/products', async (req, res) => {
       ` : `TRUE`;
 
       params.push(prov); const iProv = params.length;
-      params.push(mun);  const iMun  = params.length;
+      params.push(mun); const iMun = params.length;
 
       where.push(`
         (
@@ -197,7 +192,7 @@ router.get('/products/best-sellers', async (req, res) => {
       ` : `TRUE`;
 
       params.push(prov); const iProv = params.length;
-      params.push(mun);  const iMun  = params.length;
+      params.push(mun); const iMun = params.length;
 
       locationSql = `
         (
@@ -323,7 +318,7 @@ router.get('/products/search', async (req, res) => {
       ` : `TRUE`;
 
       params.push(prov); const iProv = params.length;
-      params.push(mun);  const iMun  = params.length;
+      params.push(mun); const iMun = params.length;
 
       locationSql = `
         (
@@ -546,7 +541,7 @@ router.delete('/admin/products/:id', authenticateToken, requireAdmin, async (req
     const prod = await client.query('SELECT id FROM products WHERE id = $1', [id])
     if (!prod.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Producto no encontrado' }) }
 
-    const inOrders = await client.query('SELECT 1 FROM line_items WHERE product_id = $1 LIMIT 1',[id])
+    const inOrders = await client.query('SELECT 1 FROM line_items WHERE product_id = $1 LIMIT 1', [id])
     if (inOrders.rowCount > 0) {
       await client.query(
         `UPDATE products
@@ -661,7 +656,7 @@ router.get('/products/category/:slug', async (req, res) => {
       ` : `TRUE`;
 
       params.push(prov); const iProv = params.length;
-      params.push(mun);  const iMun  = params.length;
+      params.push(mun); const iMun = params.length;
 
       locationSql = `
         (

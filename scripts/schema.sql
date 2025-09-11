@@ -167,11 +167,40 @@ CREATE TABLE IF NOT EXISTS pending_encargos (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- tabla de lotes de pago a owners
+CREATE TABLE IF NOT EXISTS owner_payouts (
+  id SERIAL PRIMARY KEY,
+  owner_id INT NULL REFERENCES owners(id) ON DELETE SET NULL,
+  from_date DATE NOT NULL,
+  to_date   DATE NOT NULL,
+  tz        TEXT NOT NULL DEFAULT 'America/New_York',
+  delivered_only BOOLEAN NOT NULL DEFAULT true,
+  orders_count INT NOT NULL DEFAULT 0,
+  items_count  INT NOT NULL DEFAULT 0,
+  base_cents BIGINT NOT NULL DEFAULT 0,
+  shipping_owner_cents BIGINT NOT NULL DEFAULT 0,
+  amount_to_owner_cents BIGINT NOT NULL DEFAULT 0, -- base + shipping
+  margin_cents BIGINT NOT NULL DEFAULT 0,
+  gateway_fee_cents BIGINT NOT NULL DEFAULT 0,
+  created_by TEXT,
+  note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 ALTER TABLE pending_encargos
   ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'amazon',
   ADD COLUMN IF NOT EXISTS external_id TEXT NULL,
   ADD COLUMN IF NOT EXISTS currency CHAR(3) DEFAULT 'USD'; 
 
+ALTER TABLE orders
+  ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS owner_paid BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS owner_paid_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS owner_payout_id INT;
+
+CREATE INDEX IF NOT EXISTS idx_orders_delivered_at ON orders (delivered_at DESC); 
+CREATE INDEX IF NOT EXISTS idx_orders_owner_paid ON orders (owner_paid);
+CREATE INDEX IF NOT EXISTS idx_orders_owner_payout_id ON orders (owner_payout_id);
 -- ==========================================================
 -- Asegurar compatibilidad con BD que ya existía (columnas/FKs)
 -- ==========================================================

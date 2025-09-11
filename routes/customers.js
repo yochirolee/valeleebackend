@@ -10,34 +10,17 @@ const { sendPasswordResetEmail } = require('../helpers/resend')
 
 // Crear cliente (simple)
 router.post('/customers', async (req, res) => {
-  const { email, password, first_name, last_name, phone, address } = req.body
-  if (!email || !password) return res.status(400).json({ error: 'Faltan campos requeridos' })
-
-  try {
-    const emailNorm = String(email).trim().toLowerCase()
-    const hashedPassword = await bcrypt.hash(password, 10)
-
-    const { rows } = await pool.query(
-      `INSERT INTO customers (email, password, first_name, last_name, phone, address)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, email, first_name, last_name, phone, address, metadata`,
-      [emailNorm, hashedPassword, first_name || null, last_name || null, phone || null, address || null]
-    )
-
-    res.status(201).json(rows[0])
-  } catch (error) {
-    if (error && error.code === '23505') {
-      return res.status(409).json({ error: 'El email ya está registrado' })
-    }
-    console.error(error)
-    res.status(500).json({ error: 'Error al crear el cliente' })
-  }
+  return res.status(410).json({ error: 'Endpoint obsoleto. Usa POST /register.' });
 })
 
-// Listado público simple
+//  Listado (sólo admin)
 router.get('/customers', authenticateToken, requireAdmin, async (_req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM customers')
+    const result = await pool.query(`
+           SELECT id, email, first_name, last_name, phone, address, metadata, created_at
+           FROM customers
+           ORDER BY created_at DESC
+         `)
     res.json(result.rows)
   } catch (error) {
     console.error(error)
@@ -63,7 +46,11 @@ router.get('/customers/me', authenticateToken, async (req, res) => {
 router.get('/customers/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { id } = req.params
   try {
-    const result = await pool.query('SELECT * FROM customers WHERE id = $1', [id])
+    const result = await pool.query(`
+           SELECT id, email, first_name, last_name, phone, address, metadata, created_at
+           FROM customers
+           WHERE id = $1
+        `, [id])
     if (!result.rows.length) return res.status(404).send('Cliente no encontrado')
     res.json(result.rows[0])
   } catch (error) {
@@ -82,13 +69,20 @@ router.put('/customers/me', authenticateToken, async (req, res) => {
   let i = 1;
 
   if (typeof first_name !== 'undefined') { sets.push(`first_name = $${i++}`); vals.push(first_name); }
-  if (typeof last_name  !== 'undefined') { sets.push(`last_name  = $${i++}`); vals.push(last_name); }
-  if (typeof phone      !== 'undefined') { sets.push(`phone      = $${i++}`); vals.push(phone); }
-  if (typeof address    !== 'undefined') { sets.push(`address    = $${i++}`); vals.push(address); }
+  if (typeof last_name !== 'undefined') { sets.push(`last_name  = $${i++}`); vals.push(last_name); }
+  if (typeof phone !== 'undefined') { sets.push(`phone      = $${i++}`); vals.push(phone); }
+  if (typeof address !== 'undefined') { sets.push(`address    = $${i++}`); vals.push(address); }
 
   const mdPatch = {};
   if (typeof billing_zip === 'string' && billing_zip.trim() !== '') mdPatch.billing_zip = billing_zip.trim();
-  if (metadata && typeof metadata === 'object') Object.assign(mdPatch, metadata);
+
+  // 🚫 bloquear claves peligrosas del cliente
+  const FORBIDDEN = new Set(['role', 'owner_id', 'reset_token', 'reset_expires']);
+  if (metadata && typeof metadata === 'object') {
+    for (const [k, v] of Object.entries(metadata)) {
+      if (!FORBIDDEN.has(k)) mdPatch[k] = v;
+    }
+  }
 
   if (Object.keys(mdPatch).length > 0) {
     sets.push(`metadata = COALESCE(metadata,'{}'::jsonb) || $${i++}::jsonb`);
@@ -106,8 +100,7 @@ router.put('/customers/me', authenticateToken, async (req, res) => {
       UPDATE customers
          SET ${sets.join(', ')}
        WHERE id = $${i}
-   RETURNING id, email, first_name, last_name, phone, address, metadata
-    `;
+   RETURNING id, email, first_name, last_name, phone, address, metadata`;
     const { rows } = await pool.query(q, vals);
     if (!rows.length) return res.status(404).json({ ok: false, message: 'Cliente no encontrado' });
     return res.json({ ok: true, customer: rows[0] });
@@ -115,7 +108,7 @@ router.put('/customers/me', authenticateToken, async (req, res) => {
     console.error('PUT /customers/me', e);
     return res.status(500).json({ ok: false, message: 'Error actualizando el perfil' });
   }
-})
+});
 
 // Compat/legacy update por id (no usar para password reset)
 router.put('/customers/:id', authenticateToken, requireAdmin, async (req, res) => {
@@ -123,16 +116,7 @@ router.put('/customers/:id', authenticateToken, requireAdmin, async (req, res) =
   if (id === 'me') return res.status(400).json({ ok: false, message: 'Usa PUT /customers/me' });
   if (!/^\d+$/.test(String(id))) return res.status(400).json({ ok: false, message: 'ID inválido' });
 
-  let {
-    name,
-    email,
-    address,
-    payment_method,
-    metadata,
-    first_name,
-    last_name,
-    phone,
-  } = req.body || {};
+  let { name, email, address, payment_method, metadata, first_name, last_name, phone } = req.body || {};
 
   if (name && (!first_name && !last_name)) {
     const parts = String(name).trim().split(/\s+/);
@@ -142,25 +126,29 @@ router.put('/customers/:id', authenticateToken, requireAdmin, async (req, res) =
 
   const mdPatch = {};
   if (payment_method) mdPatch.payment_method = String(payment_method);
-  if (metadata && typeof metadata === 'object') Object.assign(mdPatch, metadata);
+  // 🚫 no permitir editar role/owner_id por este endpoint
+  if (metadata && typeof metadata === 'object') {
+    const FORBIDDEN = new Set(['role', 'owner_id']);
+    for (const [k, v] of Object.entries(metadata)) {
+      if (!FORBIDDEN.has(k)) mdPatch[k] = v;
+    }
+  }
 
   const sets = [];
   const vals = [];
   let i = 1;
 
-  if (typeof email      !== 'undefined') { sets.push(`email = $${i++}`);      vals.push(String(email).trim().toLowerCase()); }
+  if (typeof email !== 'undefined') { sets.push(`email = $${i++}`); vals.push(String(email).trim().toLowerCase()); }
   if (typeof first_name !== 'undefined') { sets.push(`first_name = $${i++}`); vals.push(first_name); }
-  if (typeof last_name  !== 'undefined') { sets.push(`last_name  = $${i++}`); vals.push(last_name); }
-  if (typeof phone      !== 'undefined') { sets.push(`phone      = $${i++}`); vals.push(phone); }
-  if (typeof address    !== 'undefined') { sets.push(`address    = $${i++}`); vals.push(address); }
+  if (typeof last_name !== 'undefined') { sets.push(`last_name  = $${i++}`); vals.push(last_name); }
+  if (typeof phone !== 'undefined') { sets.push(`phone      = $${i++}`); vals.push(phone); }
+  if (typeof address !== 'undefined') { sets.push(`address    = $${i++}`); vals.push(address); }
   if (Object.keys(mdPatch).length > 0) {
     sets.push(`metadata = COALESCE(metadata,'{}'::jsonb) || $${i++}::jsonb`);
     vals.push(JSON.stringify(mdPatch));
   }
 
-  if (sets.length === 0) {
-    return res.status(400).json({ ok: false, message: 'Nada para actualizar.' });
-  }
+  if (sets.length === 0) return res.status(400).json({ ok: false, message: 'Nada para actualizar.' });
 
   vals.push(Number(id));
 
@@ -169,8 +157,7 @@ router.put('/customers/:id', authenticateToken, requireAdmin, async (req, res) =
       UPDATE customers
          SET ${sets.join(', ')}, updated_at = NOW()
        WHERE id = $${i}
-   RETURNING id, email, first_name, last_name, phone, address, metadata
-    `;
+   RETURNING id, email, first_name, last_name, phone, address, metadata`;
     const { rows } = await pool.query(q, vals);
     if (!rows.length) return res.status(404).json({ ok: false, message: 'Cliente no encontrado' });
     return res.json({ ok: true, customer: rows[0] });
@@ -178,19 +165,8 @@ router.put('/customers/:id', authenticateToken, requireAdmin, async (req, res) =
     console.error('PUT /customers/:id', error);
     return res.status(500).json({ ok: false, message: 'Error al actualizar el cliente' });
   }
-})
+});
 
-router.delete('/customers/:id', authenticateToken, requireAdmin, async (req, res) => {
-  const { id } = req.params
-  try {
-    const result = await pool.query('DELETE FROM customers WHERE id = $1 RETURNING id', [id])
-    if (!result.rows.length) return res.status(404).send('Cliente no encontrado')
-    res.send('Cliente eliminado')
-  } catch (error) {
-    console.error(error)
-    res.status(500).send('Error al eliminar el cliente')
-  }
-})
 
 /* ===== ADMIN CUSTOMERS ===== */
 
@@ -338,14 +314,13 @@ router.patch('/admin/customers/:id/role-owner', authenticateToken, requireAdmin,
 
     return res.json(upd.rows[0])
   } catch (e) {
-    try { await pool.query('ROLLBACK') } catch {}
+    try { await pool.query('ROLLBACK') } catch { }
     console.error('PATCH /admin/customers/:id/role-owner', e)
     return res.status(500).json({ error: 'No se pudo actualizar role/owner_id' })
   }
 })
 
-// DELETE admin
-router.delete('/admin/customers/:id', authenticateToken, requireAdmin, async (req, res) => {
+router.delete('/customers/:id', authenticateToken, requireAdmin, async (req, res) => {
   const id = Number(req.params.id)
   if (Number(req.user.id) === id) return res.status(400).json({ error: 'No puedes borrarte a ti misma' })
 
@@ -363,9 +338,14 @@ router.delete('/admin/customers/:id', authenticateToken, requireAdmin, async (re
   }
 })
 
+// DELETE admin borrar
+router.delete('/admin/customers/:id', authenticateToken, requireAdmin, async (req, res) => {
+  return res.status(410).json({ error: 'Endpoint obsoleto. Usa DELETE /admin/customers/:id' });
+})
+
 /* ===== AUTH ===== */
 
-// Register
+// Register (opcional: auto-login)
 router.post('/register', async (req, res) => {
   const { email, password, address = null, phone = null, first_name = null, last_name = null } = req.body
   if (!email || !password) return res.status(400).json({ error: 'Faltan campos requeridos' })
@@ -380,34 +360,69 @@ router.post('/register', async (req, res) => {
        RETURNING id, email, first_name, last_name, phone, address, metadata`,
       [emailNorm, hashedPassword, first_name, last_name, phone, address]
     )
-    res.status(201).json({ customer: rows[0] })
+    const customer = rows[0]
+    // auto-login opcional
+    const md = customer.metadata || {}
+    const ownerIdNum = Number(md.owner_id)
+    const payload = {
+      id: customer.id,
+      email: customer.email,
+      role: md.role ?? null,
+      ...(Number.isFinite(ownerIdNum) ? { owner_id: ownerIdNum } : {})
+    }
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '30d' })
+
+    return res.status(201).json({ customer, token })
   } catch (error) {
     if (error && error.code === '23505') {
       return res.status(409).json({ error: 'El email ya está registrado' })
     }
     console.error(error)
-    res.status(500).json({ error: 'Error al registrar el usuario' })
+    return res.status(500).json({ error: 'Error al registrar el usuario' })
   }
 })
+
 
 router.post('/login', async (req, res) => {
   const { email, password } = req.body
   try {
     const emailNorm = String(email || '').trim().toLowerCase()
-    const userRes = await pool.query('SELECT * FROM customers WHERE lower(email) = $1', [emailNorm])
-    if (!userRes.rows.length) return res.status(400).json({ message: 'Usuario no encontrado' })
+
+    // Trae metadata para role/owner_id
+    const userRes = await pool.query(
+      `SELECT id, email, password, metadata
+         FROM customers
+        WHERE lower(email) = $1
+        LIMIT 1`,
+      [emailNorm]
+    )
+    if (!userRes.rows.length) {
+      return res.status(400).json({ message: 'Usuario no encontrado' })
+    }
 
     const user = userRes.rows[0]
     const match = await bcrypt.compare(password, user.password)
     if (!match) return res.status(401).json({ message: 'Contraseña incorrecta' })
 
-    const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET || 'secret', { expiresIn: '1h' })
-    res.json({ token })
+    const md = user.metadata || {}
+    const ownerIdNum = Number(md.owner_id)
+    const payload = {
+      id: user.id,
+      email: user.email,
+      role: md.role ?? null,
+      // solo incluye owner_id si es num válido
+      ...(Number.isFinite(ownerIdNum) ? { owner_id: ownerIdNum } : {})
+    }
+
+    // IMPORTANTE: sin fallback 'secret'
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '30d' })
+    return res.json({ token })
   } catch (error) {
     console.error(error)
-    res.status(500).send('Error al iniciar sesión')
+    return res.status(500).send('Error al iniciar sesión')
   }
 })
+
 
 // Forgot / Reset password
 router.post('/auth/forgot-password', async (req, res) => {

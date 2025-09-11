@@ -1,6 +1,7 @@
 const express = require('express')
 const router = express.Router()
 const { pool } = require('../db')
+const { fileTypeFromBuffer } = require('file-type')
 const authenticateToken = require('../middleware/authenticateToken')
 const { requireAdmin, isAdminUser, getUserRoleAndOwnerId, requirePartnerOrAdmin } = require('../middleware/roles')
 
@@ -87,22 +88,63 @@ router.post('/orders', authenticateToken, requireAdmin, async (req, res) => {
 router.put('/orders/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { customer_name, total, status, metadata } = req.body
   try {
+    const next = status ? String(status) : null
+    const nowISO = new Date().toISOString()
+    const timeKey = next === 'delivered' ? 'delivered_at' : next === 'shipped' ? 'shipped_at' : null
+
     const result = await pool.query(
-      `UPDATE orders
+      `
+      UPDATE orders
          SET customer_name = COALESCE($1, customer_name),
-             total = COALESCE($2, total),
-             status = COALESCE($3, status),
-             metadata = COALESCE(metadata,'{}'::jsonb) || COALESCE($4::jsonb,'{}'::jsonb)
-       WHERE id = $5
+             total         = COALESCE($2, total),
+             status        = COALESCE($3, status),
+             -- si pasa a delivered, pobla la columna delivered_at; si pasa a shipped no tocar delivered_at
+             delivered_at  = CASE 
+                               WHEN $3 = 'delivered' THEN COALESCE(delivered_at, $5::timestamptz)
+                               ELSE delivered_at
+                             END,
+             metadata      = (
+               COALESCE(metadata,'{}'::jsonb)
+               || COALESCE($4::jsonb,'{}'::jsonb)
+               || CASE 
+                    WHEN $3 IN ('shipped','delivered') THEN
+                      jsonb_build_object(
+                        'status_times',
+                        COALESCE(metadata->'status_times','{}'::jsonb)
+                          || jsonb_build_object($6::text, $5::text)
+                      )
+                    ELSE '{}'::jsonb
+                  END
+               || CASE 
+                    WHEN $3 = 'delivered' THEN
+                      jsonb_build_object(
+                        'delivery',
+                        COALESCE(metadata->'delivery','{}'::jsonb)
+                          || jsonb_build_object('delivered', true, 'delivered_at', $5::text)
+                      )
+                    ELSE '{}'::jsonb
+                  END
+             )
+       WHERE id = $7
        RETURNING *`,
-      [customer_name, total, status, metadata ? JSON.stringify(metadata) : null, req.params.id]
+      [
+        customer_name ?? null,
+        total ?? null,
+        next,
+        metadata ? JSON.stringify(metadata) : null,
+        nowISO,            // $5
+        timeKey,           // $6
+        req.params.id      // $7
+      ]
     )
     if (!result.rows.length) return res.status(404).send('Orden no encontrada')
     res.json(result.rows[0])
-  } catch {
+  } catch (e) {
+    console.error(e)
     res.status(500).send('Error al actualizar orden')
   }
 })
+
 
 // Eliminar orden (admin)
 router.delete('/orders/:id', authenticateToken, requireAdmin, async (req, res) => {
@@ -115,23 +157,79 @@ router.delete('/orders/:id', authenticateToken, requireAdmin, async (req, res) =
   }
 })
 
-// Checkout session (pública)
-router.get('/checkout-sessions/:id', async (req, res) => {
-  const id = req.params.id;
+const sessionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 90,
+  standardHeaders: true,
+  legacyHeaders: false,
+})
+function isSafeId(s) {
+  // Acepta UUID/ULID/cuid/shortid/número/Base64URL-like sin espacios
+  return /^[A-Za-z0-9._:-]{3,200}$/.test(s)
+}
+
+router.get('/checkout-sessions/:id', sessionLimiter, async (req, res) => {
+  const raw = String(req.params.id ?? '')
+  const id = decodeURIComponent(raw).trim()
+
+  // Longitud dura para evitar payloads gigantes
+  if (id.length < 3 || id.length > 200) {
+    // 404 para no revelar reglas de validación
+    return res.status(404).json({ ok: false, message: 'Sesión no encontrada' })
+  }
+  if (!isSafeId(id)) {
+    return res.status(404).json({ ok: false, message: 'Sesión no encontrada' })
+  }
+
   try {
     const { rows } = await pool.query(
-      `SELECT id, status, created_order_ids, snapshot, payment, processed_at
+      `SELECT id, status, created_order_ids, snapshot, metadata, payment, processed_at
          FROM checkout_sessions
-        WHERE id = $1`,
+        WHERE id = $1
+        LIMIT 1`,
       [id]
-    );
-    if (!rows.length) return res.status(404).json({ ok: false, message: 'Sesión no encontrada' });
-    const s = rows[0];
-    return res.json({ ok: true, session: s });
+    )
+    if (!rows.length) {
+      return res.status(404).json({ ok: false, message: 'Sesión no encontrada' })
+    }
+
+    const s = rows[0] || {}
+    const kind = s?.snapshot?.kind
+    const flow = s?.metadata?.flow
+
+    const payment = s?.payment || {}
+    const safePayment = {
+      provider: typeof payment.provider === 'string' ? payment.provider : undefined,
+      mode: typeof payment.mode === 'string' ? payment.mode : undefined,
+      link_id: payment.link_id ?? undefined, // nunca expongas payment.link
+    }
+
+    const status = String(s.status || '').toLowerCase()
+    if (status === 'paid') safePayment.link_id = undefined
+
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
+    res.set('Pragma', 'no-cache')
+    res.set('Expires', '0')
+
+    return res.json({
+      ok: true,
+      session: {
+        id: s.id,
+        status,
+        created_order_ids: Array.isArray(s.created_order_ids) ? s.created_order_ids : [],
+        snapshot: typeof kind === 'string' ? { kind } : undefined,
+        metadata: typeof flow === 'string' ? { flow } : undefined,
+        payment: safePayment,
+        processed_at: s.processed_at ?? null,
+      },
+    })
   } catch (e) {
-    return res.status(500).json({ ok: false, message: e.message || 'Error leyendo sesión' });
+    console.error('GET /checkout-sessions/:id', e?.message || e)
+    return res.status(500).json({ ok: false, message: 'Error leyendo sesión' })
   }
 })
+
+
 
 // Detalle (dueño o admin) con items
 router.get('/orders/:id/detail', authenticateToken, async (req, res) => {
@@ -287,6 +385,7 @@ router.get('/admin/orders', authenticateToken, requireAdmin, async (req, res) =>
           o.total::numeric AS total_col,
           o.metadata,
           o.customer_id,
+          o.owner_paid,          
           c.email,
           c.first_name,
           c.last_name,
@@ -294,6 +393,7 @@ router.get('/admin/orders', authenticateToken, requireAdmin, async (req, res) =>
           COUNT(li.id)::int AS items_count,
           NULLIF((o.metadata->'pricing'->>'subtotal')::numeric, NULL) AS snap_subtotal,
           NULLIF((o.metadata->'pricing'->>'tax')::numeric, NULL)       AS snap_tax,
+          NULLIF((o.metadata->'pricing'->>'shipping')::numeric, NULL)  AS snap_shipping,
           NULLIF((o.metadata->'pricing'->>'total')::numeric, NULL)     AS snap_total
         FROM orders o
         LEFT JOIN customers c ON c.id = o.customer_id
@@ -342,45 +442,57 @@ function parseMd(mdRaw) {
   return null;
 }
 
-/** Deriva montos SIN duplicar fee para el listado */
 function normalizeListRow(r) {
   const md = parseMd(r.metadata);
-  const pc = md?.pricing_cents;   // centavos (fuente de verdad si existe)
-  const snap = md?.pricing;        // snapshot (USD)
+  const pc = md?.pricing_cents;   // fuente de verdad si existe (centavos)
+  const snap = md?.pricing;        // snapshot en USD
+
+  const pctEnv = Number.isFinite(CARD_FEE_PCT_BACK) ? CARD_FEE_PCT_BACK : 3;
+  const feeRate = pctEnv / 100;
 
   let subtotal = 0, tax = 0, shipping = 0, base_total = 0, card_fee = 0, total_with_fee = 0;
 
   if (pc) {
+    // === Caso 1: centavos (mejor fuente) ===
     subtotal = num(pc.subtotal_cents, 0) / 100;
-    tax      = num(pc.tax_cents, 0) / 100;
+    tax = num(pc.tax_cents, 0) / 100;
     shipping = num(pc.shipping_total_cents, 0) / 100;
-    card_fee = num(pc.card_fee_cents, 0) / 100;
+
     base_total = round2(subtotal + tax + shipping);
-    total_with_fee = pc.total_with_card_cents != null
-      ? round2(num(pc.total_with_card_cents) / 100)
-      : round2(base_total + card_fee);
-  } else if (isNum(snap?.total) && isNum(snap?.card_fee)) {
-    // En encargos, snap.total ya incluye fee
+
+    if (pc.total_with_card_cents != null) {
+      total_with_fee = round2(num(pc.total_with_card_cents) / 100);
+      card_fee = round2(total_with_fee - base_total);
+    } else {
+      card_fee = round2(num(pc.card_fee_cents, 0) / 100);
+      total_with_fee = round2(base_total + card_fee);
+    }
+  } else if (typeof snap?.total === 'number') {
+    // === Caso 2: snapshot trae total (subtotal+tax+shipping) ===
     subtotal = round2(num(snap.subtotal));
-    tax      = round2(num(snap.tax));
+    tax = round2(num(snap.tax));
     shipping = round2(num(snap.shipping));
-    total_with_fee = round2(num(snap.total));
-    card_fee = round2(num(snap.card_fee));
-    base_total = round2(total_with_fee - card_fee);
-  } else if (isNum(r.total_with_fee) && isNum(r.card_fee)) {
-    // Si ya existen columnas top-level coherentes
-    subtotal = round2(num(r.snap_subtotal ?? r.subtotal_calc));
-    tax      = round2(num(r.snap_tax));
-    total_with_fee = round2(num(r.total_with_fee));
-    card_fee = round2(num(r.card_fee));
-    base_total = round2(total_with_fee - card_fee);
+    base_total = round2(num(snap.total));
+
+    // Si no tienes card_fee en snapshot, calcúlalo con ENV
+    card_fee = Number.isFinite(Number(snap.card_fee))
+      ? round2(Number(snap.card_fee))
+      : round2(base_total * feeRate);
+
+    total_with_fee = round2(base_total + card_fee);
   } else {
-    // Fallback: recomputar desde componentes disponibles
+    // === Caso 3: fallback (reconstruir) ===
     subtotal = round2(num(r.snap_subtotal ?? r.subtotal_calc));
-    tax      = round2(num(r.snap_tax));
-    const shippingFallback = 0; // no está seleccionado en el CTE
-    base_total = round2(subtotal + tax + shippingFallback);
-    card_fee = round2(base_total * (CARD_FEE_RATE ?? 0.03));
+    tax = round2(num(r.snap_tax));
+    // Si tienes snap_shipping úsalo; si no, 0
+    shipping = round2(num(r.snap_shipping, 0));
+
+    // Si existe snap_total úsalo como base_total, si no suma componentes
+    base_total = Number.isFinite(Number(r.snap_total))
+      ? round2(num(r.snap_total))
+      : round2(subtotal + tax + shipping);
+
+    card_fee = round2(base_total * feeRate);
     total_with_fee = round2(base_total + card_fee);
   }
 
@@ -393,6 +505,7 @@ function normalizeListRow(r) {
     email: r.email,
     first_name: r.first_name,
     last_name: r.last_name,
+    owner_paid: r.owner_paid === true,
     items_count: Number(r.items_count || 0),
     subtotal,
     tax,
@@ -402,8 +515,38 @@ function normalizeListRow(r) {
   };
 }
 
+// --- Helpers locales de autorización (en este MISMO archivo) ---
+async function assertOrderOwnerOrAdmin(orderId, userId) {
+  const isAdmin = await isAdminUser(userId)
+  if (isAdmin) return { ok: true, isAdmin: true }
 
-// Detalle admin
+  const { rows } = await pool.query(
+    'SELECT customer_id FROM orders WHERE id=$1 LIMIT 1',
+    [orderId]
+  )
+  if (!rows.length) return { ok: false, notFound: true }
+  const isOwner = Number(rows[0].customer_id) === Number(userId)
+  return { ok: isOwner, isAdmin: false }
+}
+
+// Útil cuando solo tienes el id del line item
+async function assertLineItemOwnerOrAdmin(lineItemId, userId) {
+  const isAdmin = await isAdminUser(userId)
+  if (isAdmin) return { ok: true, isAdmin: true }
+
+  const { rows } = await pool.query(
+    `SELECT o.customer_id
+       FROM line_items li
+       JOIN orders o ON o.id = li.order_id
+      WHERE li.id = $1
+      LIMIT 1`,
+    [lineItemId]
+  )
+  if (!rows.length) return { ok: false, notFound: true }
+  const isOwner = Number(rows[0].customer_id) === Number(userId)
+  return { ok: isOwner, isAdmin: false }
+}
+
 // Detalle admin
 router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (req, res) => {
   try {
@@ -456,7 +599,7 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
 
     if (pc) {
       const sub = Number((pc.subtotal_cents ?? 0) / 100);
-      const tx  = Number((pc.tax_cents ?? 0) / 100);
+      const tx = Number((pc.tax_cents ?? 0) / 100);
       const shp = Number((pc.shipping_total_cents ?? 0) / 100);
       const fee = Number((pc.card_fee_cents ?? 0) / 100);
       const twc = pc.total_with_card_cents != null ? Number(pc.total_with_card_cents) / 100 : null;
@@ -533,26 +676,33 @@ router.patch('/admin/orders/:id/status', authenticateToken, requireAdmin, async 
       const nowISO = new Date().toISOString();
       const timeKey = next === 'shipped' ? 'shipped_at' : 'delivered_at';
 
+      // ... arriba queda igual (nowISO, timeKey, etc.)
+
       const upd = await pool.query(
         `UPDATE orders
-            SET status = $1,
-                metadata = COALESCE(metadata,'{}'::jsonb)
-                           || jsonb_build_object(
-                                'status_times',
-                                COALESCE(metadata->'status_times','{}'::jsonb)
-                                  || jsonb_build_object($2::text, $3::text)
-                              )
-                           || CASE WHEN $1 = 'delivered' THEN
-                                jsonb_build_object(
-                                  'delivery',
-                                  COALESCE(metadata->'delivery','{}'::jsonb)
-                                  || jsonb_build_object('delivered', true, 'delivered_at', $3::text)
-                                )
-                              ELSE '{}'::jsonb END
-          WHERE id = $4
-      RETURNING id, created_at, status, payment_method, total, metadata`,
+      SET status = $1,
+          -- si pasa a delivered, pobla la columna con el MISMO instante:
+          delivered_at = CASE WHEN $1 = 'delivered'
+                              THEN COALESCE(delivered_at, $3::timestamptz)
+                              ELSE delivered_at END,
+          metadata = COALESCE(metadata,'{}'::jsonb)
+                     || jsonb_build_object(
+                          'status_times',
+                          COALESCE(metadata->'status_times','{}'::jsonb)
+                            || jsonb_build_object($2::text, $3::text)
+                        )
+                     || CASE WHEN $1 = 'delivered' THEN
+                          jsonb_build_object(
+                            'delivery',
+                            COALESCE(metadata->'delivery','{}'::jsonb)
+                              || jsonb_build_object('delivered', true, 'delivered_at', $3::text)
+                          )
+                        ELSE '{}'::jsonb END
+    WHERE id = $4
+RETURNING id, created_at, status, payment_method, total, metadata`,
         [next, timeKey, nowISO, id]
-      );
+      )
+
 
       if (!upd.rows.length) return res.status(404).send('Orden no encontrada');
 
@@ -618,16 +768,31 @@ const partnerLimiter = rateLimit({
 // Helper para capturar errores de multer y responder bonito
 function handleUpload(field) {
   return (req, res, next) => {
-    upload.single(field)(req, res, (err) => {
-      if (!err) return next()
-      if (err?.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({ ok: false, message: `La imagen excede ${MAX_UPLOAD_MB} MB` })
+    upload.single(field)(req, res, async (err) => {
+      if (err) {
+        if (err?.code === 'LIMIT_FILE_SIZE') {
+          return res.status(413).json({ ok: false, message: `La imagen excede ${MAX_UPLOAD_MB} MB` })
+        }
+        if (err?.code === 'LIMIT_FILE_TYPE' || err?.message === 'invalid_type') {
+          return res.status(400).json({ ok: false, message: 'Formato no permitido. Usa JPG, PNG, WEBP o HEIC.' })
+        }
+        console.error('[multer] Error:', err)
+        return res.status(400).json({ ok: false, message: 'Error subiendo archivo' })
       }
-      if (err?.code === 'LIMIT_FILE_TYPE' || err?.message === 'invalid_type') {
-        return res.status(400).json({ ok: false, message: 'Formato no permitido. Usa JPG, PNG, WEBP o HEIC.' })
+
+      // ✅ Validación de “magic number” (firma real)
+      if (req.file && req.file.buffer) {
+        try {
+          const ft = await fileTypeFromBuffer(req.file.buffer)
+          if (!ft || !/^(image\/(jpeg|png|webp|heic|heif))$/i.test(ft.mime)) {
+            return res.status(400).json({ ok: false, message: 'Archivo inválido (firma no coincide)' })
+          }
+        } catch (e) {
+          return res.status(400).json({ ok: false, message: 'No se pudo validar el archivo' })
+        }
       }
-      console.error('[multer] Error:', err)
-      return res.status(400).json({ ok: false, message: 'Error subiendo archivo' })
+
+      return next()
     })
   }
 }
@@ -680,12 +845,51 @@ router.get('/partner/orders', authenticateToken, requirePartnerOrAdmin, async (r
     const { rows } = await pool.query(sql, vals)
     const total = rows[0]?.total_rows ? Number(rows[0].total_rows) : 0
 
+    const isDelivery = role === 'delivery'
+    const isOwnerOrAdmin = role === 'owner' || role === 'admin'
+
+    // Whitelist + filtrado por rol
     res.json({
-      items: rows.map(({ total_rows, ...r }) => r),
+      items: rows.map(({ total_rows, ...r }) => {
+        const md = r.metadata || {}
+
+        const safeMetadata = {
+          delivery_assignee_id: md.delivery_assignee_id || undefined,
+          delivery_assignee_name: md.delivery_assignee_name || undefined,
+          // opcional: estados operativos mínimos
+          status_times: md.status_times || undefined,
+          delivery: md.delivery
+            ? {
+              delivered: md.delivery.delivered === true ? true : undefined,
+              delivered_at: md.delivery.delivered_at || undefined,
+            }
+            : undefined,
+        }
+
+        return {
+          id: r.id,
+          created_at: r.created_at,
+          status: r.status,
+          total: typeof r.total === 'number' ? r.total : null, // la UI muestra "Total: ..."
+          first_name: r.first_name || null,
+          last_name: r.last_name || null,
+
+          // ⚠️ Email solo para owner/admin. Para delivery => NO enviar.
+          customer_email: isOwnerOrAdmin ? r.customer_email || r.email || null : undefined,
+
+          // otros que ya usa tu UI para lógicas
+          payment_method: r.payment_method,
+          owner_id: r.owner_id,
+          customer_id: r.customer_id,
+
+          // metadata saneada
+          metadata: safeMetadata,
+        }
+      }),
       page: p,
       pages: Math.max(1, Math.ceil(total / l)),
       total,
-      limit: l
+      limit: l,
     })
   } catch (e) {
     console.error('GET /partner/orders', e)
@@ -782,16 +986,20 @@ router.patch('/partner/orders/:id/status', authenticateToken, requirePartnerOrAd
   const upd = await pool.query(
     `UPDATE orders
         SET status = $1,
+            delivered_at = CASE WHEN $1 = 'delivered'
+                                THEN COALESCE(delivered_at, $3::timestamptz)
+                                ELSE delivered_at END,
             metadata = COALESCE(metadata,'{}'::jsonb)
                        || jsonb_build_object(
                             'status_times',
-                            COALESCE(metadata->'status_times','{}'::jsonb) || jsonb_build_object($2::text, $3::text)
+                            COALESCE(metadata->'status_times','{}'::jsonb)
+                              || jsonb_build_object($2::text, $3::text)
                           )
                        || CASE WHEN $1 = 'delivered' THEN
                             jsonb_build_object(
                               'delivery',
-                              COALESCE(metadata->'delivery','{}'::jsonb) ||
-                              jsonb_build_object('delivered', true, 'delivered_at', $3::text)
+                              COALESCE(metadata->'delivery','{}'::jsonb)
+                                || jsonb_build_object('delivered', true, 'delivered_at', $3::text)
                             )
                           ELSE '{}'::jsonb END
       WHERE id = $4
@@ -799,13 +1007,13 @@ router.patch('/partner/orders/:id/status', authenticateToken, requirePartnerOrAd
     [nextStatus, timeKey, nowISO, id]
   )
 
+
   return res.json({ ok: true, ...upd.rows[0] })
 })
 
 // POST /partner/orders/:id/mark-delivered
 // multipart/form-data: photo?, notes?, client_tx_id?
-router.post(
-  '/partner/orders/:id/mark-delivered',
+router.post('/partner/orders/:id/mark-delivered',
   authenticateToken,
   requirePartnerOrAdmin,
   partnerLimiter,
@@ -905,10 +1113,11 @@ router.post(
       const upd = await client.query(
         `UPDATE orders
             SET status = 'delivered',
+                delivered_at = COALESCE(delivered_at, $3::timestamptz),
                 metadata = $2::jsonb
           WHERE id = $1
           RETURNING id, status, metadata`,
-        [id, JSON.stringify(newMeta)]
+        [id, JSON.stringify(newMeta), nowISO]
       )
 
       await client.query('COMMIT')
@@ -1000,7 +1209,9 @@ router.get('/customers/:customerId/orders', authenticateToken, async (req, res) 
 
 
 /* LINE ITEMS (tal cual estaban) */
-router.get('/line-items', authenticateToken, async (_req, res) => {
+router.get('/line-items', authenticateToken, async (req, res) => {
+  const isAdmin = await isAdminUser(req.user.id)
+  if (!isAdmin) return res.sendStatus(403)
   try {
     const result = await pool.query('SELECT * FROM line_items')
     res.json(result.rows)
@@ -1009,22 +1220,37 @@ router.get('/line-items', authenticateToken, async (_req, res) => {
   }
 })
 
+
 router.get('/line-items/:id', authenticateToken, async (req, res) => {
+  const id = Number(req.params.id)
+  if (!Number.isFinite(id)) return res.status(400).send('id inválido')
   try {
-    const result = await pool.query('SELECT * FROM line_items WHERE id = $1', [req.params.id])
-    if (!result.rows.length) return res.status(404).send('No encontrado')
-    res.json(result.rows[0])
+    const { rows } = await pool.query('SELECT * FROM line_items WHERE id=$1', [id])
+    if (!rows.length) return res.status(404).send('No encontrado')
+
+    const authz = await assertLineItemOwnerOrAdmin(id, req.user.id)
+    if (!authz.ok) return res.sendStatus(authz.notFound ? 404 : 403)
+
+    res.json(rows[0])
   } catch {
     res.status(500).send('Error al obtener el line item')
   }
 })
 
-router.post('/line-items', async (req, res) => {
-  const { order_id, product_id, quantity, unit_price, metadata } = req.body
+
+router.post('/line-items', authenticateToken, async (req, res) => {
+  const { order_id, product_id, quantity, unit_price, metadata } = req.body || {}
+  const orderId = Number(order_id)
+  if (!Number.isFinite(orderId)) return res.status(400).send('order_id inválido')
+
+  const authz = await assertOrderOwnerOrAdmin(orderId, req.user.id)
+  if (!authz.ok) return res.sendStatus(authz.notFound ? 404 : 403)
+
   try {
     const result = await pool.query(
-      'INSERT INTO line_items (order_id, product_id, quantity, unit_price, metadata) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [order_id, product_id, quantity, unit_price, metadata || {}]
+      `INSERT INTO line_items (order_id, product_id, quantity, unit_price, metadata)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [orderId, product_id ?? null, Number(quantity) || 0, Number(unit_price) || 0, metadata || {}]
     )
     res.status(201).json(result.rows[0])
   } catch {
@@ -1032,13 +1258,25 @@ router.post('/line-items', async (req, res) => {
   }
 })
 
-router.delete('/line-items/:id', async (req, res) => {
+
+router.delete('/line-items/:id', authenticateToken, async (req, res) => {
+  const id = Number(req.params.id)
+  if (!Number.isFinite(id)) return res.status(400).send('id inválido')
+
   try {
-    await pool.query('DELETE FROM line_items WHERE id = $1', [req.params.id])
+    const { rows } = await pool.query('SELECT order_id FROM line_items WHERE id=$1', [id])
+    if (!rows.length) return res.sendStatus(204)
+
+    const orderId = Number(rows[0].order_id)
+    const authz = await assertOrderOwnerOrAdmin(orderId, req.user.id)
+    if (!authz.ok) return res.sendStatus(authz.notFound ? 404 : 403)
+
+    await pool.query('DELETE FROM line_items WHERE id=$1', [id])
     res.sendStatus(204)
   } catch {
     res.status(500).send('Error al eliminar el line item')
   }
 })
+
 
 module.exports = router

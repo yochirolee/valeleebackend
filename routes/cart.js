@@ -6,10 +6,16 @@ const authenticateToken = require('../middleware/authenticateToken');
 /* Crear carrito */
 router.post('/cart', authenticateToken, async (req, res) => {
   try {
-    const { customer_id } = req.body;
+    const customerId = req.user.id;
+    const existing = await pool.query(
+      'SELECT * FROM carts WHERE customer_id = $1 AND completed = false LIMIT 1',
+      [customerId]
+    );
+    if (existing.rows.length) return res.status(200).json(existing.rows[0]);
+
     const result = await pool.query(
       'INSERT INTO carts (customer_id) VALUES ($1) RETURNING *',
-      [customer_id || null]
+      [customerId]
     );
     res.status(201).json(result.rows[0]);
   } catch {
@@ -17,21 +23,29 @@ router.post('/cart', authenticateToken, async (req, res) => {
   }
 });
 
+
 /* Agregar item a un carrito específico */
-router.post('/cart/:id/items', authenticateToken, async (req, res) => {
+router.get('/cart/:id/items', authenticateToken, async (req, res) => {
   try {
-    const cartId = req.params.id;
-    const { product_id, quantity, unit_price } = req.body;
-    const result = await pool.query(
-      `INSERT INTO cart_items (cart_id, product_id, quantity, unit_price)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [cartId, product_id, quantity, unit_price]
+    const cartId = Number(req.params.id);
+    const customerId = req.user.id;
+
+    const own = await pool.query(
+      'SELECT 1 FROM carts WHERE id = $1 AND customer_id = $2',
+      [cartId, customerId]
     );
-    res.status(201).json(result.rows[0]);
+    if (!own.rows.length) return res.sendStatus(404);
+
+    const result = await pool.query(
+      `SELECT * FROM cart_items WHERE cart_id = $1 ORDER BY id ASC`,
+      [cartId]
+    );
+    res.json(result.rows);
   } catch {
-    res.status(500).send('Error al agregar item al carrito');
+    res.status(500).send('Error al obtener los items del carrito');
   }
 });
+
 
 /* Listar items de un carrito */
 router.get('/cart/:id/items', async (req, res) => {
@@ -48,18 +62,29 @@ router.get('/cart/:id/items', async (req, res) => {
 });
 
 /* Eliminar ítem específico del carrito */
-router.delete('/cart/:cartId/items/:itemId', async (req, res) => {
+router.delete('/cart/:cartId/items/:itemId', authenticateToken, async (req, res) => {
   try {
     const { cartId, itemId } = req.params;
-    await pool.query(
+    const customerId = req.user.id;
+
+    const own = await pool.query(
+      'SELECT 1 FROM carts WHERE id = $1 AND customer_id = $2',
+      [cartId, customerId]
+    );
+    if (!own.rows.length) return res.sendStatus(404);
+
+    const del = await pool.query(
       `DELETE FROM cart_items WHERE id = $1 AND cart_id = $2`,
       [itemId, cartId]
     );
+    if (del.rowCount === 0) return res.sendStatus(404);
+
     res.sendStatus(204);
   } catch {
     res.status(500).send('Error al eliminar el item del carrito');
   }
 });
+
 
 /* Obtener carrito activo + items del usuario autenticado */
 router.get('/cart', authenticateToken, async (req, res) => {
@@ -258,8 +283,18 @@ router.delete('/cart/remove/:itemId', authenticateToken, async (req, res) => {
 
 /* Validar carrito por stock */
 router.post('/cart/validate', authenticateToken, async (req, res) => {
-  const { cartId } = req.body
+  const customerId = req.user.id;
+  const cartId = Number(req.body.cartId);
+
   try {
+    const own = await pool.query(
+      'SELECT 1 FROM carts WHERE id = $1 AND customer_id = $2 AND completed = false',
+      [cartId, customerId]
+    );
+    if (!own.rows.length) {
+      return res.status(404).json({ error: 'Carrito no encontrado' });
+    }
+
     const items = await pool.query(`
       SELECT ci.product_id, ci.quantity as requested,
              p.title, p.stock_qty, o.name as owner_name
@@ -267,11 +302,11 @@ router.post('/cart/validate', authenticateToken, async (req, res) => {
       JOIN products p ON p.id = ci.product_id
       LEFT JOIN owners o ON o.id = p.owner_id
       WHERE ci.cart_id = $1
-    `, [cartId])
+    `, [cartId]);
 
-    const unavailable = []
+    const unavailable = [];
     for (const it of items.rows) {
-      const available = Number(it.stock_qty)
+      const available = Number(it.stock_qty);
       if (available < it.requested) {
         unavailable.push({
           product_id: it.product_id,
@@ -279,19 +314,20 @@ router.post('/cart/validate', authenticateToken, async (req, res) => {
           owner_name: it.owner_name,
           requested: it.requested,
           available,
-        })
+        });
       }
     }
 
     if (unavailable.length > 0) {
-      return res.json({ ok: false, message: 'Hay productos sin disponibilidad.', unavailable })
+      return res.json({ ok: false, message: 'Hay productos sin disponibilidad.', unavailable });
     }
 
-    return res.json({ ok: true })
+    return res.json({ ok: true });
   } catch (e) {
     console.error('POST /cart/validate error', e);
     return res.status(500).json({ error: 'Error validando carrito' });
   }
-})
+});
+
 
 module.exports = router

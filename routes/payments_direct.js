@@ -6,7 +6,7 @@ const authenticateToken = require('../middleware/authenticateToken');
 const { sale } = require('../services/bmspaySale');
 const { sendCustomerOrderEmail, sendOwnerOrderEmail } = require('../helpers/emailOrders');
 
-const API_BASE_URL = process.env.API_BASE_URL || 'http://localhost:4000';
+const API_BASE_URL = process.env.API_BASE_URL;
 
 // === Helpers comunes ===
 async function fetchSession(client, sessionId, customerId) {
@@ -24,10 +24,12 @@ async function loadCartItems(client, cartId) {
       ci.product_id,
       ci.quantity,
       ci.unit_price,
-      ci.metadata,
+      ci.metadata AS cart_item_metadata,
       p.title,
       p.owner_id,
-      o.name AS owner_name
+      p.price        AS product_price,
+      p.metadata     AS product_metadata,
+      o.name         AS owner_name
     FROM cart_items ci
     LEFT JOIN products p ON p.id = ci.product_id
     LEFT JOIN owners o ON o.id = p.owner_id
@@ -37,6 +39,7 @@ async function loadCartItems(client, cartId) {
   const { rows } = await client.query(itemsQ, [cartId]);
   return rows;
 }
+
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -82,6 +85,22 @@ function unitCents(item) {
 function taxCentsPerItem(item) {
   const m = item.metadata || {};
   return Number.isInteger(m.tax_cents) ? m.tax_cents : 0;
+}
+
+function baseCentsFromProduct(pMeta, pPrice) {
+  const meta = pMeta || {};
+  if (Number.isInteger(meta.price_cents) && meta.price_cents >= 0) {
+    return meta.price_cents;
+  }
+  const price = Number(pPrice || 0);
+  return Math.round(price * 100);
+}
+
+function marginPctFromProduct(pMeta) {
+  const meta = pMeta || {};
+  const raw = Number(meta.margin_pct);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 0;
 }
 
 async function quoteShippingThroughSelf({ token, cartId, shipping }) {
@@ -206,25 +225,46 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
     const items = await loadCartItems(client, s.cart_id);
     if (!items.length) return res.status(400).json({ ok: false, message: 'Carrito vacío' });
 
+    
     const groupsByOwner = {};
     for (const it of items) {
       const key = String(it.owner_id || 0);
       if (!groupsByOwner[key]) {
-        groupsByOwner[key] = {
-          owner_id: it.owner_id || null,
-          owner_name: it.owner_name || null,
-          subtotal_cents: 0,
-          tax_cents: 0,
-          items: []
-        };
-      }
-      const uc = unitCents(it);
-      const tc = taxCentsPerItem(it);
-      const qty = Number(it.quantity);
-      groupsByOwner[key].subtotal_cents += uc * qty;
-      groupsByOwner[key].tax_cents += tc * qty;
-      groupsByOwner[key].items.push({ product_id: it.product_id, quantity: qty, unit_cents: uc, tax_cents: tc, title: it.title });
-    }
+    groupsByOwner[key] = {
+      owner_id: it.owner_id || null,
+      owner_name: it.owner_name || null,
+      subtotal_cents: 0,
+      tax_cents: 0,
+      owner_base_subtotal_cents: 0, // ← NUEVO: suma de base_cents * qty (snapshot)
+      items: []
+    };
+  }
+
+  // precios de venta (con margen y tax por item) ya los calculabas
+  const uc = unitCents({ unit_price: it.unit_price, metadata: it.cart_item_metadata });
+  const tc = taxCentsPerItem({ metadata: it.cart_item_metadata });
+  const qty = Number(it.quantity);
+
+  // SNAPSHOT de costos del producto (base y margen al momento de la orden)
+  const base_cents_snapshot = baseCentsFromProduct(it.product_metadata, it.product_price);
+  const margin_pct_snapshot = marginPctFromProduct(it.product_metadata);
+
+  groupsByOwner[key].subtotal_cents += uc * qty;
+  groupsByOwner[key].tax_cents += tc * qty;
+  groupsByOwner[key].owner_base_subtotal_cents += base_cents_snapshot * qty;
+
+  groupsByOwner[key].items.push({
+    product_id: it.product_id,
+    quantity: qty,
+    unit_cents: uc,
+    tax_cents: tc,
+    title: it.title,
+    // snapshots que vamos a guardar en line_items.metadata
+    base_cents_snapshot,
+    margin_pct_snapshot
+  });
+}
+
 
     // 3) Cotizar envío server-side
     const shipPayload = (country === 'CU')
@@ -251,7 +291,16 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
     const subtotal_cents = Object.values(groupsByOwner).reduce((a, g) => a + g.subtotal_cents, 0);
     const tax_cents = Object.values(groupsByOwner).reduce((a, g) => a + g.tax_cents, 0);
     const grand_total_cents = subtotal_cents + tax_cents + shipping_total_cents;
-    const amount = Number((grand_total_cents / 100).toFixed(2));
+
+    // === AÑADIDO: aplicar % de tarjeta en el servidor ===
+    const CARD_FEE_PCT = Number(process.env.CARD_FEE_PCT ?? '3');
+    const FEE_RATE = Number.isFinite(CARD_FEE_PCT) ? CARD_FEE_PCT / 100 : 0;
+
+    const card_fee_cents = Math.round(grand_total_cents * FEE_RATE);
+    const amount_cents = grand_total_cents + card_fee_cents;
+
+    // Este 'amount' es lo que se envía al gateway (lo que realmente se cobra)
+    const amount = Number((amount_cents / 100).toFixed(2));
 
     // 5) Validar stock (lock pesimista previo al cobro)
     await client.query('BEGIN');
@@ -376,22 +425,45 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
       const ownerShip = Number((Number(shippingByOwner[String(ownerId)] || 0)).toFixed(2));
       const ownerTotal = Number((ownerSubtotal + ownerTax + ownerShip).toFixed(2));
 
+      const owner_base_total_cents = Math.round((ownerSubtotal + ownerTax + ownerShip) * 100);
+      const owner_card_fee_cents = Math.round(owner_base_total_cents * FEE_RATE);
+      const owner_total_with_fee_cents = owner_base_total_cents + owner_card_fee_cents;
+
+      const owner_base_subtotal_cents = g.owner_base_subtotal_cents;
+
       const ordQ = await client.query(
         `INSERT INTO orders (customer_id, owner_id, customer_name, status, payment_method, total, metadata)
-         VALUES ($1, $2, $3, 'paid', 'bmspay_direct', $4, $5::jsonb)
-         RETURNING id`,
+        VALUES ($1, $2, $3, 'paid', 'bmspay_direct', $4, $5::jsonb)
+        RETURNING id`,
         [
           customerId,
           ownerId,
           customerName,
-          ownerTotal,
+          ownerTotal, // ← OJO: este sigue siendo total sin fee, como ya lo hacías
           JSON.stringify({
             checkout_session_id: s.id,
             shipping: { country, ...shipping },
             billing: orderMeta.billing || null,
             terms: orderMeta.terms || undefined,
             payer: orderMeta.payer || undefined,
-            pricing: { subtotal: ownerSubtotal, tax: ownerTax, shipping: ownerShip, total: ownerTotal },
+            pricing: { // USD (humano)
+              subtotal: ownerSubtotal,
+              tax: ownerTax,
+              shipping: ownerShip,
+              total: Number((owner_base_total_cents / 100).toFixed(2)),
+              card_fee_pct: CARD_FEE_PCT,
+              card_fee: Number((owner_card_fee_cents / 100).toFixed(2)),
+              total_with_card: Number((owner_total_with_fee_cents / 100).toFixed(2)),
+              owner_base_subtotal: Number((owner_base_subtotal_cents / 100).toFixed(2)) // ← NUEVO
+            },
+            pricing_cents: { // CENTAVOS (verdad)
+              subtotal_cents: Math.round(ownerSubtotal * 100),
+              tax_cents: Math.round(ownerTax * 100),
+              shipping_total_cents: Math.round(ownerShip * 100),
+              card_fee_cents: owner_card_fee_cents,
+              total_with_card_cents: owner_total_with_fee_cents,
+              owner_base_subtotal_cents // ← NUEVO
+            },
             payment: {
               provider: 'bmspay',
               mode: 'direct',
@@ -406,15 +478,30 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           })
         ]
       );
+
       const orderId = ordQ.rows[0].id;
       createdOrderIds.push(orderId);
 
       for (const it of g.items) {
+        const lineMeta = {
+          base_cents: it.base_cents_snapshot,         // snapshot del costo base
+          margin_pct: it.margin_pct_snapshot,         // snapshot del margen del producto
+          unit_cents_snapshot: it.unit_cents,         // (opcional) por si quieres ver lo vendido sin tax, en cents
+          tax_cents_snapshot: it.tax_cents            // (opcional)
+        };
+      
         await client.query(
           `INSERT INTO line_items (order_id, product_id, quantity, unit_price, metadata)
-           VALUES ($1, $2, $3, $4, '{}'::jsonb)`,
-          [orderId, it.product_id, Number(it.quantity), Number((it.unit_cents / 100).toFixed(2))]
+           VALUES ($1, $2, $3, $4, $5::jsonb)`,
+          [
+            orderId,
+            it.product_id,
+            Number(it.quantity),
+            Number((it.unit_cents / 100).toFixed(2)),  // unit_price USD (como ya hacías)
+            JSON.stringify(lineMeta)
+          ]
         );
+      
         await client.query(
           `UPDATE products
               SET stock_qty = stock_qty - $1,
@@ -424,6 +511,7 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           [Number(it.quantity), it.product_id]
         );
       }
+      
     }
 
     // Finalizar sesión → paid
@@ -437,12 +525,14 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
                          || jsonb_build_object(
                               'shipping_by_owner', $2::jsonb,
                               'pricing', jsonb_build_object(
-                                 'subtotal_cents', $3::int,
-                                 'tax_cents', $4::int,
-                                 'shipping_total_cents', $5::int
+                              'subtotal_cents', $3::int,
+                              'tax_cents', $4::int,
+                              'shipping_total_cents', $5::int,
+                              'card_fee_cents', $6::int,
+                              'total_with_card_cents', $7::int
                               )
                             ),
-              created_order_ids = $6::int[]
+              created_order_ids = $8::int[]
         WHERE id = $1`,
       [
         sessionId,
@@ -450,6 +540,8 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
         subtotal_cents,
         tax_cents,
         shipping_total_cents,
+        card_fee_cents,       
+        amount_cents,
         createdOrderIds
       ]
     );
