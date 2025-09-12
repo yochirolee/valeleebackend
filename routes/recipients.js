@@ -9,6 +9,11 @@ const isUSZip = (s) => /^\d{5}(-\d{4})?$/.test(String(s || '').trim())
 const isCUCI  = (s) => /^\d{11}$/.test(String(s || '').trim())
 const PHONE_MIN = (s) => String(s || '').replace(/\D/g,'').length >= 8
 
+// Normalizadores
+const norm = (s) => String(s ?? '').trim().toLowerCase().replace(/\s+/g, ' ')
+const normUSState = (s) => String(s ?? '').trim().toUpperCase()
+const normZipRaw = (s) => String(s ?? '').replace(/\D/g, '') // 5 o 9 dígitos sin guiones/espacios
+
 function pickRecipientBody(body) {
   const r = body || {}
   const base = {
@@ -105,6 +110,63 @@ function toClientRow(r) {
   }
 }
 
+// ---- Anti-duplicados (consulta previa) ----
+async function findDuplicateRecipient(client, customerId, rec, excludeId = null) {
+  if (rec.country === 'CU') {
+    const vals = [
+      customerId,
+      rec.country,
+      rec.first_name, rec.last_name,
+      rec.cu_address, rec.cu_province, rec.cu_municipality,
+      rec.cu_ci
+    ]
+    let sql = `
+      SELECT id FROM shipping_recipients
+      WHERE customer_id = $1 AND country = $2
+        AND lower(first_name) = lower($3)
+        AND lower(last_name)  = lower($4)
+        AND regexp_replace(lower(cu_address), '\\s+', ' ', 'g') = regexp_replace(lower($5), '\\s+', ' ', 'g')
+        AND lower(cu_province) = lower($6)
+        AND lower(coalesce(cu_municipality, '')) = lower(coalesce($7, ''))
+        AND cu_ci = $8
+    `
+    if (excludeId != null) {
+      vals.push(excludeId)
+      sql += ` AND id <> $${vals.length}`
+    }
+    const r = await client.query(sql, vals)
+    return r.rows[0]?.id || null
+  }
+
+  if (rec.country === 'US') {
+    const vals = [
+      customerId,
+      rec.country,
+      rec.first_name, rec.last_name,
+      rec.us_address_line1, rec.us_city, rec.us_state,
+      rec.us_zip
+    ]
+    let sql = `
+      SELECT id FROM shipping_recipients
+      WHERE customer_id = $1 AND country = $2
+        AND lower(first_name) = lower($3)
+        AND lower(last_name)  = lower($4)
+        AND regexp_replace(lower(us_address_line1), '\\s+', ' ', 'g') = regexp_replace(lower($5), '\\s+', ' ', 'g')
+        AND lower(us_city) = lower($6)
+        AND upper(us_state) = upper($7)
+        AND regexp_replace(us_zip, '\\D', '', 'g') = regexp_replace($8, '\\D', '', 'g')
+    `
+    if (excludeId != null) {
+      vals.push(excludeId)
+      sql += ` AND id <> $${vals.length}`
+    }
+    const r = await client.query(sql, vals)
+    return r.rows[0]?.id || null
+  }
+
+  return null
+}
+
 // Listar mis destinatarios (?country=CU|US)
 router.get('/', authenticateToken, async (req, res) => {
   try {
@@ -141,10 +203,15 @@ router.get('/:id', authenticateToken, async (req, res) => {
 
 // Crear
 router.post('/', authenticateToken, async (req, res) => {
+  const client = await pool.connect()
   try {
     const rec = pickRecipientBody(req.body || {})
     const err = validateRecipient(rec)
     if (err) return res.status(400).json({ error: err })
+
+    // Chequeo previo anti-duplicados
+    const dupId = await findDuplicateRecipient(client, req.user.id, rec, null)
+    if (dupId) return res.status(409).json({ error: 'recipient_duplicate', existing_id: dupId })
 
     const q = `
       INSERT INTO shipping_recipients
@@ -158,7 +225,7 @@ router.post('/', authenticateToken, async (req, res) => {
        $12,$13,$14,$15,$16,
        $17,$18,$19,$20,$21)
       RETURNING *`
-    const { rows } = await pool.query(q, [
+    const { rows } = await client.query(q, [
       req.user.id, rec.country, rec.first_name, rec.last_name, rec.phone, rec.email, rec.instructions, rec.metadata,
       rec.label, rec.notes, !!rec.is_default,
       rec.cu_province, rec.cu_municipality, rec.cu_address, rec.cu_ci, rec.cu_area_type,
@@ -167,70 +234,81 @@ router.post('/', authenticateToken, async (req, res) => {
 
     const inserted = rows[0]
     if (inserted.is_default === true) {
-      await pool.query('SELECT set_unique_default_recipient($1,$2)', [req.user.id, inserted.id])
+      await client.query('SELECT set_unique_default_recipient($1,$2)', [req.user.id, inserted.id])
     }
 
     res.status(201).json(toClientRow(inserted))
   } catch (e) {
+    if (e?.code === '23505') {
+      // por si dispara el unique index de la BD
+      return res.status(409).json({ error: 'recipient_duplicate' })
+    }
     console.error('POST /recipients', e)
     res.status(500).json({ error: 'recipient_create_failed' })
+  } finally {
+    client.release()
   }
 })
 
 // Actualizar (solo dueño) — acepta PUT y PATCH
 async function updateRecipientCore(id, userId, body, res) {
-  const own = await pool.query('SELECT customer_id FROM shipping_recipients WHERE id=$1', [id])
-  if (!own.rows.length) return res.status(404).json({ error: 'not_found' })
-  if (Number(own.rows[0].customer_id) !== Number(userId)) return res.sendStatus(403)
+  const client = await pool.connect()
+  try {
+    const own = await client.query('SELECT customer_id FROM shipping_recipients WHERE id=$1', [id])
+    if (!own.rows.length) return res.status(404).json({ error: 'not_found' })
+    if (Number(own.rows[0].customer_id) !== Number(userId)) return res.sendStatus(403)
 
-  const rec = pickRecipientBody(body || {})
-  const err = validateRecipient(rec)
-  if (err) return res.status(400).json({ error: err })
+    const rec = pickRecipientBody(body || {})
+    const err = validateRecipient(rec)
+    if (err) return res.status(400).json({ error: err })
 
-  const q = `
-    UPDATE shipping_recipients SET
-      country=$2, first_name=$3, last_name=$4, phone=$5, email=$6, instructions=$7, metadata=$8,
-      label=$9, notes=$10, is_default=$11,
-      cu_province=$12, cu_municipality=$13, cu_address=$14, cu_ci=$15, cu_area_type=$16,
-      us_address_line1=$17, us_address_line2=$18, us_city=$19, us_state=$20, us_zip=$21
-    WHERE id=$1
-    RETURNING *`
-  const { rows } = await pool.query(q, [
-    id,
-    rec.country, rec.first_name, rec.last_name, rec.phone, rec.email, rec.instructions, rec.metadata,
-    rec.label, rec.notes, !!rec.is_default,
-    rec.cu_province, rec.cu_municipality, rec.cu_address, rec.cu_ci, rec.cu_area_type,
-    rec.us_address_line1, rec.us_address_line2, rec.us_city, rec.us_state, rec.us_zip
-  ])
+    // Chequeo previo anti-duplicados (excluyendo el propio id)
+    const dupId = await findDuplicateRecipient(client, userId, rec, id)
+    if (dupId) return res.status(409).json({ error: 'recipient_duplicate', existing_id: dupId })
 
-  const updated = rows[0]
-  if (updated.is_default === true) {
-    await pool.query('SELECT set_unique_default_recipient($1,$2)', [userId, updated.id])
+    const q = `
+      UPDATE shipping_recipients SET
+        country=$2, first_name=$3, last_name=$4, phone=$5, email=$6, instructions=$7, metadata=$8,
+        label=$9, notes=$10, is_default=$11,
+        cu_province=$12, cu_municipality=$13, cu_address=$14, cu_ci=$15, cu_area_type=$16,
+        us_address_line1=$17, us_address_line2=$18, us_city=$19, us_state=$20, us_zip=$21
+      WHERE id=$1
+      RETURNING *`
+    const { rows } = await client.query(q, [
+      id,
+      rec.country, rec.first_name, rec.last_name, rec.phone, rec.email, rec.instructions, rec.metadata,
+      rec.label, rec.notes, !!rec.is_default,
+      rec.cu_province, rec.cu_municipality, rec.cu_address, rec.cu_ci, rec.cu_area_type,
+      rec.us_address_line1, rec.us_address_line2, rec.us_city, rec.us_state, rec.us_zip
+    ])
+
+    const updated = rows[0]
+    if (updated.is_default === true) {
+      await client.query('SELECT set_unique_default_recipient($1,$2)', [userId, updated.id])
+    }
+
+    return res.json(toClientRow(updated))
+  } catch (e) {
+    if (e?.code === '23505') {
+      return res.status(409).json({ error: 'recipient_duplicate' })
+    }
+    console.error('UPDATE /recipients/:id', e)
+    res.status(500).json({ error: 'recipient_update_failed' })
+  } finally {
+    client.release()
   }
-
-  return res.json(toClientRow(updated))
 }
 
 router.put('/:id', authenticateToken, async (req, res) => {
   const id = Number(req.params.id)
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'id inválido' })
-  try {
-    await updateRecipientCore(id, req.user.id, req.body, res)
-  } catch (e) {
-    console.error('PUT /recipients/:id', e)
-    res.status(500).json({ error: 'recipient_update_failed' })
-  }
+  await updateRecipientCore(id, req.user.id, req.body, res)
 })
 
 router.patch('/:id', authenticateToken, async (req, res) => {
   const id = Number(req.params.id)
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'id inválido' })
-  try {
-    await updateRecipientCore(id, req.user.id, req.body, res)
-  } catch (e) {
-    console.error('PATCH /recipients/:id', e)
-    res.status(500).json({ error: 'recipient_update_failed' })
-  }
+  await updateRecipientCore(id, req.user.id, req.body, res)
 })
 
 // Marcar como predeterminado (solo dueño)

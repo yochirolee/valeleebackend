@@ -484,6 +484,53 @@ BEGIN
   END IF;
 END $$;
 
+-- === Unicidad por combinación de campos normalizados ===
+-- CU: mismo (first_name, last_name, ci, address, province, municipality) por customer
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname='public' AND indexname='ux_recipient_cu_dedupe'
+  ) THEN
+    CREATE UNIQUE INDEX ux_recipient_cu_dedupe
+      ON shipping_recipients (
+        customer_id,
+        country,
+        lower(trim(first_name)),
+        lower(trim(last_name)),
+        -- address normalizado (espacios colapsados)
+        regexp_replace(lower(trim(cu_address)), '\s+', ' ', 'g'),
+        lower(trim(cu_province)),
+        lower(trim(coalesce(cu_municipality, ''))),
+        cu_ci
+      )
+      WHERE country = 'CU';
+  END IF;
+END $$;
+
+-- US: mismo (first_name, last_name, address_line1, city, state, zip) por customer
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname='public' AND indexname='ux_recipient_us_dedupe'
+  ) THEN
+    CREATE UNIQUE INDEX ux_recipient_us_dedupe
+      ON shipping_recipients (
+        customer_id,
+        country,
+        lower(trim(first_name)),
+        lower(trim(last_name)),
+        regexp_replace(lower(trim(us_address_line1)), '\s+', ' ', 'g'),
+        lower(trim(us_city)),
+        upper(trim(us_state)),
+        regexp_replace(us_zip, '\D', '', 'g')  -- zip sin guiones/espacios
+      )
+      WHERE country = 'US';
+  END IF;
+END $$;
+
+
 -- =========================================
 -- Helper opcional (para uso manual desde app/SQL si lo necesitas)
 -- =========================================
@@ -512,5 +559,50 @@ BEGIN
       ON owner_payouts(owner_id, from_date, to_date);
   END IF;
 END $$;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'orders_owner_payout_id_fkey'
+  ) THEN
+    ALTER TABLE orders
+      ADD CONSTRAINT orders_owner_payout_id_fkey
+      FOREIGN KEY (owner_payout_id) REFERENCES owner_payouts(id)
+      ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- 1) Agregar columnas si faltan
+ALTER TABLE customers
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+
+-- 2) Backfill seguro
+UPDATE customers SET created_at = COALESCE(created_at, now());
+UPDATE customers SET updated_at = COALESCE(updated_at, now());
+
+-- 3) Defaults/constraints
+ALTER TABLE customers
+  ALTER COLUMN created_at SET DEFAULT now(),
+  ALTER COLUMN created_at SET NOT NULL;
+
+ALTER TABLE customers
+  ALTER COLUMN updated_at SET DEFAULT now();
+
+-- 4) Trigger para mantener updated_at (re-usa tu set_updated_at())
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'trg_customers_updated_at'
+  ) THEN
+    CREATE TRIGGER trg_customers_updated_at
+      BEFORE UPDATE ON customers
+      FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
+END $$;
+
+-- 5) (Opcional) Índice para ORDER BY created_at
+CREATE INDEX IF NOT EXISTS idx_customers_created_at
+  ON customers (created_at DESC);
 
 COMMIT;
