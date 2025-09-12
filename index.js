@@ -11,6 +11,7 @@ const adminReportsRouter = require('./routes/admin_reports')
 const { ownersRouter, ownersPublicRouter } = require('./routes/owners')
 const ownerAreasRouter = require('./routes/ownerAreas')
 const shippingRouter = require('./routes/shipping')
+const recipientsRouter = require('./routes/recipients')
 
 // routers por funcionalidad
 const productsRouter = require('./routes/products')
@@ -106,6 +107,8 @@ app.use('/shipping', authenticateToken, shippingRouter)
 app.use('/admin/owners', authenticateToken, requireAdmin, ownersRouter);
 app.use('/admin/reports', adminReportsRouter);
 app.use('/admin/orders', authenticateToken, adminReportsRouter);
+app.use('/recipients', recipientsRouter)
+
 // Rutas de entrega
 app.use('/deliver', require('./routes/deliver'))
 

@@ -380,4 +380,137 @@ BEGIN
   END IF;
 END $$;
 
+-- =========================================
+-- shipping_recipients (destinatarios guardados por cliente)
+-- =========================================
+CREATE TABLE IF NOT EXISTS shipping_recipients (
+  id SERIAL PRIMARY KEY,
+  customer_id INT NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+
+  -- comunes
+  country CHAR(2) NOT NULL CHECK (country IN ('CU','US')),
+  first_name TEXT NOT NULL,
+  last_name  TEXT NOT NULL,
+  phone      TEXT NOT NULL,
+  email      TEXT,                 -- opcional
+  instructions TEXT,               -- notas para el repartidor
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+  -- etiquetas y notas de UI
+  label TEXT,                      -- ej: "Casa de mamá", "Trabajo"
+  notes TEXT,                      -- notas internas/cliente
+
+  -- flag de default
+  is_default BOOLEAN NOT NULL DEFAULT false,
+
+  -- CU
+  cu_province     TEXT,
+  cu_municipality TEXT,
+  cu_address      TEXT,            -- dirección exacta
+  cu_ci           TEXT,            -- 11 dígitos
+  cu_area_type    TEXT,            -- urbano/rural/habana/etc
+
+  -- US
+  us_address_line1 TEXT,
+  us_address_line2 TEXT,
+  us_city          TEXT,
+  us_state         CHAR(2),
+  us_zip           TEXT,
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Índices útiles
+CREATE INDEX IF NOT EXISTS idx_recipients_customer
+  ON shipping_recipients(customer_id);
+
+CREATE INDEX IF NOT EXISTS idx_recipients_customer_country
+  ON shipping_recipients(customer_id, country);
+
+CREATE INDEX IF NOT EXISTS idx_recipients_default
+  ON shipping_recipients(customer_id, is_default);
+
+-- Garantiza UN solo default por cliente
+CREATE UNIQUE INDEX IF NOT EXISTS ux_recipients_one_default_per_customer
+  ON shipping_recipients(customer_id)
+  WHERE is_default;
+
+-- =========================================
+-- Trigger actualizado updated_at
+-- =========================================
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'trg_shipping_recipients_updated_at'
+  ) THEN
+    CREATE TRIGGER trg_shipping_recipients_updated_at
+      BEFORE UPDATE ON shipping_recipients
+      FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+  END IF;
+END $$;
+
+-- =========================================
+-- Enforce: único is_default = true por cliente (auto-limpieza)
+-- =========================================
+CREATE OR REPLACE FUNCTION trg_enforce_single_default_recipient()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.is_default IS TRUE THEN
+    UPDATE shipping_recipients
+       SET is_default = FALSE
+     WHERE customer_id = NEW.customer_id
+       AND id <> COALESCE(NEW.id, 0)
+       AND is_default = TRUE;
+  END IF;
+  RETURN NEW;
+END; $$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'trg_shipping_recipients_single_default'
+  ) THEN
+    CREATE TRIGGER trg_shipping_recipients_single_default
+      BEFORE INSERT OR UPDATE OF is_default ON shipping_recipients
+      FOR EACH ROW EXECUTE FUNCTION trg_enforce_single_default_recipient();
+  END IF;
+END $$;
+
+-- =========================================
+-- Helper opcional (para uso manual desde app/SQL si lo necesitas)
+-- =========================================
+CREATE OR REPLACE FUNCTION set_unique_default_recipient(p_customer_id INT, p_recipient_id INT)
+RETURNS VOID AS $$
+BEGIN
+  UPDATE shipping_recipients
+     SET is_default = FALSE
+   WHERE customer_id = p_customer_id
+     AND id <> p_recipient_id
+     AND is_default = TRUE;
+
+  UPDATE shipping_recipients
+     SET is_default = TRUE
+   WHERE id = p_recipient_id
+     AND customer_id = p_customer_id;
+END; $$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname='public' AND indexname='uniq_owner_payout_window'
+  ) THEN
+    CREATE UNIQUE INDEX uniq_owner_payout_window
+      ON owner_payouts(owner_id, from_date, to_date);
+  END IF;
+END $$;
+
 COMMIT;
