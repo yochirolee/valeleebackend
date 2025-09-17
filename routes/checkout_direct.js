@@ -10,6 +10,23 @@ const JWT_SECRET = process.env.JWT_SECRET;
 // % fee para tarjeta
 const CARD_FEE_PCT = Number(process.env.CARD_FEE_PCT ?? '3');
 const FEE_RATE = Number.isFinite(CARD_FEE_PCT) ? CARD_FEE_PCT / 100 : 0;
+const API_BASE_URL = process.env.API_BASE_URL;
+
+async function quoteShippingThroughSelf({ token, cartId, shipping }) {
+  const res = await fetch(`${API_BASE_URL}/shipping/quote`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: token } : {}),
+    },
+    body: JSON.stringify({ cartId, shipping }),
+  });
+  const txt = await res.text();
+  let data = null;
+  try { data = txt ? JSON.parse(txt) : null; } catch { data = null; }
+  return { ok: res.ok, status: res.status, data };
+}
+
 
 /* =========================
  * Helpers
@@ -123,111 +140,6 @@ function groupByOwner(items) {
   return Array.from(groups.values());
 }
 
-/**
- * Carga de configs de envío por owner y país
- */
-async function loadOwnerShippingConfigs(ownerIds, country) {
-  if (!ownerIds.length) return new Map();
-
-  const sql = `
-    SELECT owner_id, country, active, mode,
-           us_flat,
-           cu_hab_city_flat, cu_hab_rural_flat, cu_other_city_flat, cu_other_rural_flat,
-           cu_rate_per_lb,
-           cu_hab_city_base, cu_hab_rural_base, cu_other_city_base, cu_other_rural_base,
-           cu_min_fee,
-           cu_restrict_to_list
-      FROM owner_shipping_config
-     WHERE owner_id = ANY($1::int[])
-       AND country = $2
-  `;
-  const { rows } = await pool.query(sql, [ownerIds, country]);
-  const map = new Map();
-  for (const r of rows) map.set(String(r.owner_id), r);
-  return map;
-}
-
-/**
- * Carga lista blanca de Cuba para los owners
- */
-async function loadOwnerWhitelistCU(ownerIds) {
-  if (!ownerIds.length) return new Map();
-  const sql = `
-    SELECT owner_id, lower(province) AS province, lower(COALESCE(municipality, '')) AS municipality
-      FROM owner_cu_areas
-     WHERE owner_id = ANY($1::int[])
-  `;
-  const { rows } = await pool.query(sql, [ownerIds]);
-  const map = new Map(); // owner_id -> array entries
-  for (const r of rows) {
-    const k = String(r.owner_id);
-    if (!map.has(k)) map.set(k, []);
-    map.get(k).push({ province: r.province, municipality: r.municipality });
-  }
-  return map;
-}
-
-/**
- * Calcula costo de envío por owner según país y config
- */
-function computeOwnerShipping(country, cfg, group, shippingInput) {
-  if (!cfg || cfg.active !== true) return { ok: false, reason: 'no_config' };
-
-  if (country === 'US') {
-    const flat = Number(cfg.us_flat);
-    if (!Number.isFinite(flat)) return { ok: false, reason: 'no_us_flat' };
-    return { ok: true, amount: to2(flat), mode: 'fixed' };
-  }
-
-  if (country === 'CU') {
-    const zone = zoneKeyForCuba(shippingInput.province, shippingInput.area_type);
-    const mode = (cfg.mode || 'fixed').toLowerCase();
-
-    if (mode === 'fixed') {
-      let flat = null;
-      if (zone === 'habana_city') flat = cfg.cu_hab_city_flat;
-      else if (zone === 'habana_municipio') flat = cfg.cu_hab_rural_flat;
-      else if (zone === 'provincias_city') flat = cfg.cu_other_city_flat;
-      else if (zone === 'provincias_municipio') flat = cfg.cu_other_rural_flat;
-
-      if (!Number.isFinite(Number(flat))) return { ok: false, reason: 'no_flat_for_zone' };
-      return { ok: true, amount: to2(flat), mode: 'fixed', zone };
-    }
-
-    // by_weight
-    const rate = Number(cfg.cu_rate_per_lb || 0);
-    let base = 0;
-    if (zone === 'habana_city') base = Number(cfg.cu_hab_city_base || 0);
-    else if (zone === 'habana_municipio') base = Number(cfg.cu_hab_rural_base || 0);
-    else if (zone === 'provincias_city') base = Number(cfg.cu_other_city_base || 0);
-    else if (zone === 'provincias_municipio') base = Number(cfg.cu_other_rural_base || 0);
-
-    let amount = base + rate * Number(group.weight_lb || 0);
-    const minFee = Number(cfg.cu_min_fee || 0);
-    if (Number.isFinite(minFee) && amount < minFee) amount = minFee;
-
-    return { ok: true, amount: to2(amount), mode: 'by_weight', zone, rate, base, min_fee: minFee || 0 };
-  }
-
-  return { ok: false, reason: 'unsupported_country' };
-}
-
-/**
- * Verifica lista blanca de Cuba (si cu_restrict_to_list = true)
- */
-function checkCUWhitelist(cfg, whitelistMap, shippingInput) {
-  if (!cfg || cfg.cu_restrict_to_list !== true) return true; // no restringe
-  const ownerId = String(cfg.owner_id);
-  const list = whitelistMap.get(ownerId) || [];
-  const p = String(shippingInput.province || '').toLowerCase();
-  const m = String(shippingInput.municipality || '').toLowerCase();
-  // Coincide si hay (prov igual) y (mun null/vacio o igual)
-  for (const row of list) {
-    if (row.province === p && (!row.municipality || row.municipality === m)) return true;
-  }
-  return false;
-}
-
 /* =========================
  *   POST /checkout-direct/start-direct
  * =======================*/
@@ -275,98 +187,42 @@ router.post('/start-direct', ensureAuth, async (req, res) => {
 
     // 3) Agrupar por owner y calcular subtotal/tax/weight
     const groups = groupByOwner(items);
-    const ownerIds = groups
-      .map(g => (g.owner_id == null ? null : Number(g.owner_id)))
-      .filter((v) => Number.isInteger(v));
 
-    // 4) Calcular envío por owner
-    let shippingByOwner = {};
-    let shippingBreakdown = [];
-    let unavailableOwners = [];
+    // 4) Cotizar envío usando el endpoint central (respeta transport = 'sea' | 'air')
+    const quote = await quoteShippingThroughSelf({
+      token: req.headers['authorization'],
+      cartId,
+      shipping, // ← incluye transport cuando country === 'CU'
+    });
 
-    if (country === 'US') {
-      const cfgs = await loadOwnerShippingConfigs(ownerIds, 'US');
-
-      for (const g of groups) {
-        if (g.owner_id == null) {
-          // Sin owner: envío 0
-          shippingByOwner['null'] = 0;
-          shippingBreakdown.push({ owner_id: null, owner_name: g.owner_name, mode: 'fixed', weight_lb: g.weight_lb, shipping_cents: 0 });
-          continue;
-        }
-        const cfg = cfgs.get(String(g.owner_id));
-        const r = computeOwnerShipping('US', { ...cfg, owner_id: g.owner_id }, g, shipping);
-        if (!r.ok) {
-          unavailableOwners.push({ owner_id: g.owner_id, owner_name: g.owner_name, reason: r.reason });
-          continue;
-        }
-        const cents = Math.round(Number(r.amount) * 100);
-        shippingByOwner[String(g.owner_id)] = Number(r.amount);
-        shippingBreakdown.push({
-          owner_id: g.owner_id,
-          owner_name: g.owner_name,
-          mode: r.mode,
-          weight_lb: g.weight_lb,
-          shipping_cents: cents,
-        });
-      }
-    } else if (country === 'CU') {
-      const cfgs = await loadOwnerShippingConfigs(ownerIds, 'CU');
-      const wl = await loadOwnerWhitelistCU(ownerIds);
-
-      for (const g of groups) {
-        if (g.owner_id == null) {
-          shippingByOwner['null'] = 0;
-          shippingBreakdown.push({ owner_id: null, owner_name: g.owner_name, mode: 'fixed', weight_lb: g.weight_lb, shipping_cents: 0 });
-          continue;
-        }
-        const rawCfg = cfgs.get(String(g.owner_id));
-        if (!rawCfg || rawCfg.active !== true) {
-          unavailableOwners.push({ owner_id: g.owner_id, owner_name: g.owner_name, reason: 'no_config' });
-          continue;
-        }
-
-        // Lista blanca
-        if (rawCfg.cu_restrict_to_list === true) {
-          const ok = checkCUWhitelist({ ...rawCfg, owner_id: g.owner_id }, wl, shipping);
-          if (!ok) {
-            unavailableOwners.push({ owner_id: g.owner_id, owner_name: g.owner_name, reason: 'not_in_whitelist' });
-            continue;
-          }
-        }
-
-        const r = computeOwnerShipping('CU', { ...rawCfg, owner_id: g.owner_id }, g, shipping);
-        if (!r.ok) {
-          unavailableOwners.push({ owner_id: g.owner_id, owner_name: g.owner_name, reason: r.reason });
-          continue;
-        }
-        const cents = Math.round(Number(r.amount) * 100);
-        shippingByOwner[String(g.owner_id)] = Number(r.amount);
-        shippingBreakdown.push({
-          owner_id: g.owner_id,
-          owner_name: g.owner_name,
-          mode: r.mode,
-          weight_lb: g.weight_lb,
-          shipping_cents: cents,
-        });
-      }
+    if (!quote.ok || !quote.data) {
+      return res.status(409).json({ ok: false, message: 'No se pudo cotizar el envío' });
     }
-
-    if (unavailableOwners.length) {
+    if (quote.data.ok === false) {
       return res.status(400).json({
         ok: false,
         message: 'Uno o más proveedores no pueden entregar a la dirección seleccionada.',
-        unavailable: unavailableOwners,
+        unavailable: Array.isArray(quote.data.unavailable) ? quote.data.unavailable : [],
       });
     }
 
+    const shipping_total_cents = Number(quote.data.shipping_total_cents || 0);
+    const breakdown = Array.isArray(quote.data.breakdown) ? quote.data.breakdown : [];
+
+    // === per-owner: mapa owner_id -> monto USD
+    const shippingByOwner = breakdown.reduce((acc, b) => {
+      const key = String(b.owner_id ?? 'null');
+      acc[key] = Number((Number(b.shipping_cents || 0) / 100).toFixed(2));
+      return acc;
+    }, {});
+
     // 5) Totales
     const subtotal = to2(groups.reduce((acc, g) => acc + g.subtotal, 0));
-    const tax = to2(groups.reduce((acc, g) => acc + g.tax, 0));
-    const shippingTotal = to2(Object.values(shippingByOwner).reduce((a, b) => a + Number(b || 0), 0));
-    const baseTotal = to2(subtotal + tax + shippingTotal);          // ← total de la orden (sin fee)
+    const tax = to2(groups.reduce((acc, g) => acc + g.tax, 0));     
+    const shippingTotal = Number((shipping_total_cents / 100).toFixed(2));
+    const baseTotal = to2(subtotal + tax + shippingTotal);
     const cardFee = to2(baseTotal * FEE_RATE);
-    const amountDirect = to2(baseTotal + cardFee);                  // ← a cobrar con tarjeta
+    const amountDirect = to2(baseTotal + cardFee);  // ← a cobrar con tarjeta
 
     // 6) Guardar sesión
     await client.query('BEGIN');
@@ -384,6 +240,7 @@ router.post('/start-direct', ensureAuth, async (req, res) => {
         address: shipping.address,
         area_type: shipping.area_type,
         instructions: shipping.instructions || null,
+        transport: shipping.transport || null,
       }
       : {
         first_name: shipping.first_name,
@@ -397,6 +254,7 @@ router.post('/start-direct', ensureAuth, async (req, res) => {
         zip: shipping.zip,
         instructions: shipping.instructions || null,
       };
+
 
     const snapshot = {
       groups: groups.map(g => ({
@@ -449,7 +307,7 @@ router.post('/start-direct', ensureAuth, async (req, res) => {
       amount: amountDirect, // el modal cobra esto
     });
   } catch (e) {
-    await pool.query('ROLLBACK').catch(() => { });
+    await client.query('ROLLBACK').catch(() => {});
     console.error('[start-direct] error', e);
     return res.status(500).json({ ok: false, message: e.message || 'Error iniciando pago directo' });
   } finally {

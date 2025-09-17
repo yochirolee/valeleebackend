@@ -225,50 +225,54 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
     const items = await loadCartItems(client, s.cart_id);
     if (!items.length) return res.status(400).json({ ok: false, message: 'Carrito vacío' });
 
-    
+
     const groupsByOwner = {};
     for (const it of items) {
       const key = String(it.owner_id || 0);
       if (!groupsByOwner[key]) {
-    groupsByOwner[key] = {
-      owner_id: it.owner_id || null,
-      owner_name: it.owner_name || null,
-      subtotal_cents: 0,
-      tax_cents: 0,
-      owner_base_subtotal_cents: 0, // ← NUEVO: suma de base_cents * qty (snapshot)
-      items: []
-    };
-  }
+        groupsByOwner[key] = {
+          owner_id: it.owner_id || null,
+          owner_name: it.owner_name || null,
+          subtotal_cents: 0,
+          tax_cents: 0,
+          owner_base_subtotal_cents: 0, // ← NUEVO: suma de base_cents * qty (snapshot)
+          items: []
+        };
+      }
 
-  // precios de venta (con margen y tax por item) ya los calculabas
-  const uc = unitCents({ unit_price: it.unit_price, metadata: it.cart_item_metadata });
-  const tc = taxCentsPerItem({ metadata: it.cart_item_metadata });
-  const qty = Number(it.quantity);
+      // precios de venta (con margen y tax por item) ya los calculabas
+      const uc = unitCents({ unit_price: it.unit_price, metadata: it.cart_item_metadata });
+      const tc = taxCentsPerItem({ metadata: it.cart_item_metadata });
+      const qty = Number(it.quantity);
 
-  // SNAPSHOT de costos del producto (base y margen al momento de la orden)
-  const base_cents_snapshot = baseCentsFromProduct(it.product_metadata, it.product_price);
-  const margin_pct_snapshot = marginPctFromProduct(it.product_metadata);
+      // SNAPSHOT de costos del producto (base y margen al momento de la orden)
+      const base_cents_snapshot = baseCentsFromProduct(it.product_metadata, it.product_price);
+      const margin_pct_snapshot = marginPctFromProduct(it.product_metadata);
 
-  groupsByOwner[key].subtotal_cents += uc * qty;
-  groupsByOwner[key].tax_cents += tc * qty;
-  groupsByOwner[key].owner_base_subtotal_cents += base_cents_snapshot * qty;
+      groupsByOwner[key].subtotal_cents += uc * qty;
+      groupsByOwner[key].tax_cents += tc * qty;
+      groupsByOwner[key].owner_base_subtotal_cents += base_cents_snapshot * qty;
 
-  groupsByOwner[key].items.push({
-    product_id: it.product_id,
-    quantity: qty,
-    unit_cents: uc,
-    tax_cents: tc,
-    title: it.title,
-    // snapshots que vamos a guardar en line_items.metadata
-    base_cents_snapshot,
-    margin_pct_snapshot
-  });
-}
+      groupsByOwner[key].items.push({
+        product_id: it.product_id,
+        quantity: qty,
+        unit_cents: uc,
+        tax_cents: tc,
+        title: it.title,
+        // snapshots que vamos a guardar en line_items.metadata
+        base_cents_snapshot,
+        margin_pct_snapshot
+      });
+    }
+
+    const transport =
+      (orderMeta?.shipping && orderMeta.shipping.transport) ||
+      (orderMeta?.shipping_prefs && orderMeta.shipping_prefs.transport) || null;
 
 
     // 3) Cotizar envío server-side
     const shipPayload = (country === 'CU')
-      ? { country: 'CU', province: shipping.province, municipality: shipping.municipality, area_type: shipping.area_type }
+      ? { country: 'CU', province: shipping.province, municipality: shipping.municipality, area_type: shipping.area_type, ...(transport ? { transport } : {}), }
       : { country: 'US', state: shipping.state, city: shipping.city, zip: shipping.zip };
 
     const quote = await quoteShippingThroughSelf({ token: authHeader, cartId: s.cart_id, shipping: shipPayload });
@@ -489,7 +493,7 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           unit_cents_snapshot: it.unit_cents,         // (opcional) por si quieres ver lo vendido sin tax, en cents
           tax_cents_snapshot: it.tax_cents            // (opcional)
         };
-      
+
         await client.query(
           `INSERT INTO line_items (order_id, product_id, quantity, unit_price, metadata)
            VALUES ($1, $2, $3, $4, $5::jsonb)`,
@@ -501,7 +505,7 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
             JSON.stringify(lineMeta)
           ]
         );
-      
+
         await client.query(
           `UPDATE products
               SET stock_qty = stock_qty - $1,
@@ -511,7 +515,7 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           [Number(it.quantity), it.product_id]
         );
       }
-      
+
     }
 
     // Finalizar sesión → paid
@@ -540,7 +544,7 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
         subtotal_cents,
         tax_cents,
         shipping_total_cents,
-        card_fee_cents,       
+        card_fee_cents,
         amount_cents,
         createdOrderIds
       ]
