@@ -606,3 +606,80 @@ CREATE INDEX IF NOT EXISTS idx_customers_created_at
   ON customers (created_at DESC);
 
 COMMIT;
+
+BEGIN;
+
+-- 1) owner_shipping_config: agregar columna de transporte para Cuba
+ALTER TABLE owner_shipping_config
+  ADD COLUMN IF NOT EXISTS cu_transport TEXT
+    CHECK (cu_transport IN ('sea','air'));
+
+-- 2) Quitar unicidad antigua (owner_id, country) para permitir dos filas CU (barco/avión)
+DO $$
+DECLARE cons TEXT;
+BEGIN
+  SELECT c.conname
+    INTO cons
+  FROM pg_constraint c
+  JOIN pg_class t ON c.conrelid = t.oid
+  WHERE t.relname = 'owner_shipping_config'
+    AND c.contype = 'u'
+    AND pg_get_constraintdef(c.oid) LIKE '%(owner_id, country)%';
+  IF cons IS NOT NULL THEN
+    EXECUTE 'ALTER TABLE owner_shipping_config DROP CONSTRAINT '||quote_ident(cons);
+  END IF;
+END $$;
+
+-- 3) Nueva unicidad: un registro por (owner, country, transporte/null)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_indexes
+    WHERE schemaname='public' AND indexname='uniq_owner_country_transport'
+  ) THEN
+    CREATE UNIQUE INDEX uniq_owner_country_transport
+      ON owner_shipping_config (owner_id, country, COALESCE(cu_transport, '_'));
+  END IF;
+END $$;
+
+-- 4) Umbral y cargo extra para exceso de peso (por registro)
+ALTER TABLE owner_shipping_config
+  ADD COLUMN IF NOT EXISTS cu_over_weight_threshold_lbs NUMERIC(10,2) DEFAULT 100,
+  ADD COLUMN IF NOT EXISTS cu_over_weight_fee NUMERIC(10,2) DEFAULT 0;
+
+-- 5) Migración de datos: marcar CU existentes como 'sea' y duplicar a 'air'
+--    (solo si aún no existen filas 'air')
+WITH cu_base AS (
+  SELECT *
+  FROM owner_shipping_config
+  WHERE country = 'CU' AND (cu_transport IS NULL OR cu_transport = 'sea')
+)
+UPDATE owner_shipping_config
+   SET cu_transport = 'sea'
+ WHERE country = 'CU' AND cu_transport IS NULL;
+
+INSERT INTO owner_shipping_config (
+  owner_id, country, mode, currency,
+  us_flat,
+  cu_hab_city_flat, cu_hab_rural_flat, cu_other_city_flat, cu_other_rural_flat,
+  cu_rate_per_lb, cu_hab_city_base, cu_hab_rural_base, cu_other_city_base, cu_other_rural_base,
+  cu_min_fee, active, created_at, cu_restrict_to_list, cu_transport,
+  cu_over_weight_threshold_lbs, cu_over_weight_fee
+)
+SELECT
+  owner_id, country, mode, currency,
+  us_flat,
+  cu_hab_city_flat, cu_hab_rural_flat, cu_other_city_flat, cu_other_rural_flat,
+  cu_rate_per_lb, cu_hab_city_base, cu_hab_rural_base, cu_other_city_base, cu_other_rural_base,
+  cu_min_fee, active, created_at, cu_restrict_to_list, 'air' AS cu_transport,
+  cu_over_weight_threshold_lbs, cu_over_weight_fee
+FROM owner_shipping_config s
+WHERE s.country = 'CU' AND s.cu_transport = 'sea'
+  AND NOT EXISTS (
+    SELECT 1 FROM owner_shipping_config x
+     WHERE x.owner_id = s.owner_id
+       AND x.country = 'CU'
+       AND x.cu_transport = 'air'
+  );
+
+COMMIT;

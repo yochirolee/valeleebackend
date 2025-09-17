@@ -4,27 +4,19 @@ const router = express.Router();
 const { pool } = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 
-// Helpers zonificación Cuba
 function zoneKeyForCuba(province, area_type) {
   const isHabana = String(province || '').trim().toLowerCase() === 'la habana';
   const isCity = (area_type === 'city');
   if (isHabana) return isCity ? 'habana_city' : 'habana_municipio';
   return isCity ? 'provincias_city' : 'provincias_municipio';
 }
+function toCents(usd) { const n = Number(usd); return Number.isFinite(n) ? Math.round(n * 100) : 0; }
 
-function toCents(usd) {
-  const n = Number(usd);
-  if (!Number.isFinite(n)) return 0;
-  return Math.round(n * 100);
-}
-
-// POST /shipping/quote  { cartId, shipping: {...} }
 router.post('/quote', authenticateToken, async (req, res) => {
   const { cartId, shipping } = req.body || {};
   if (!cartId || !shipping || !shipping.country) {
     return res.status(400).json({ ok: false, message: 'cartId y shipping.country son requeridos' });
   }
-
   const userId = req.user?.id;
   if (!userId) return res.status(401).json({ ok: false, message: 'Unauthorized' });
 
@@ -34,23 +26,20 @@ router.post('/quote', authenticateToken, async (req, res) => {
       `SELECT id, customer_id FROM carts WHERE id = $1 AND customer_id = $2`,
       [cartId, userId]
     );
-    if (!cartQ.rows.length) {
-      return res.status(404).json({ ok: false, message: 'Carrito no encontrado' });
-    }
+    if (!cartQ.rows.length) return res.status(404).json({ ok: false, message: 'Carrito no encontrado' });
 
     const country = String(shipping.country || '').toUpperCase();
     const prov = String(shipping.province || shipping.provincia || '').trim();
     const mun  = String(shipping.municipality || shipping.municipio || '').trim();
-    const zoneKey = country === 'CU'
-      ? zoneKeyForCuba(prov, shipping.area_type)
-      : null;
+    const areaType = shipping.area_type; // 'city' | 'municipio'
+    const transport = (country === 'CU' ? String(shipping.transport || 'sea') : null); // 'sea'|'air'
+    const zoneKey = country === 'CU' ? zoneKeyForCuba(prov, areaType) : null;
 
     const itemsQ = await client.query(
       `
       SELECT
         p.owner_id,
         o.name AS owner_name,
-        -- config del país solicitado
         osc.mode,
         osc.us_flat,
         osc.cu_rate_per_lb,
@@ -60,11 +49,11 @@ router.post('/quote', authenticateToken, async (req, res) => {
         osc.cu_other_city_base, osc.cu_other_rural_base,
         osc.cu_min_fee,
         COALESCE(osc.cu_restrict_to_list, false) AS cu_restrict_to_list,
+        COALESCE(osc.cu_over_weight_threshold_lbs, 100) AS over_thr_lbs,
+        COALESCE(osc.cu_over_weight_fee, 0) AS over_fee_usd,
 
-        -- suma de peso por owner
         SUM(COALESCE(p.weight,0) * ci.quantity) AS total_weight,
 
-        -- área permitida?
         CASE
           WHEN $2 = 'CU' AND COALESCE(osc.cu_restrict_to_list, false) = true THEN
             EXISTS (
@@ -82,20 +71,21 @@ router.post('/quote', authenticateToken, async (req, res) => {
         ON osc.owner_id = p.owner_id
        AND osc.active   = true
        AND osc.country  = $2
+       AND ($2 <> 'CU' OR osc.cu_transport = $5)
       WHERE ci.cart_id = $1
       GROUP BY
         p.owner_id, o.name,
         osc.mode, osc.us_flat, osc.cu_rate_per_lb,
         osc.cu_hab_city_flat, osc.cu_hab_rural_flat, osc.cu_other_city_flat, osc.cu_other_rural_flat,
         osc.cu_hab_city_base, osc.cu_hab_rural_base, osc.cu_other_city_base, osc.cu_other_rural_base,
-        osc.cu_min_fee, osc.cu_restrict_to_list
+        osc.cu_min_fee, osc.cu_restrict_to_list, osc.cu_over_weight_threshold_lbs, osc.cu_over_weight_fee
       ORDER BY p.owner_id ASC
       `,
-      [cartId, country, prov, mun]
+      [cartId, country, prov, mun, transport]
     );
 
     const breakdown = [];
-    const unavailable = []; // owners fuera de área
+    const unavailable = [];
     let totalCents = 0;
 
     for (const row of itemsQ.rows) {
@@ -105,17 +95,16 @@ router.post('/quote', authenticateToken, async (req, res) => {
 
       if (country === 'CU' && row.cu_restrict_to_list && !row.allowed_area) {
         unavailable.push({ owner_id: ownerId, owner_name: ownerName });
-        continue; // no sumamos shipping porque no se puede entregar
+        continue;
       }
 
       let cents = 0;
       let mode  = 'none';
 
       if (country === 'US') {
-        const fixedUsd = Number(row.us_flat || 0);
-        cents = toCents(fixedUsd);
+        cents = toCents(Number(row.us_flat || 0));
         mode  = 'fixed';
-      } else if (country === 'CU') {
+      } else {
         const cfgMode = String(row.mode || 'fixed').toLowerCase();
         if (cfgMode === 'weight') {
           mode = 'by_weight';
@@ -125,10 +114,8 @@ router.post('/quote', authenticateToken, async (req, res) => {
             zoneKey === 'habana_municipio'     ? Number(row.cu_hab_rural_base || 0) :
             zoneKey === 'provincias_city'      ? Number(row.cu_other_city_base || 0) :
             zoneKey === 'provincias_municipio' ? Number(row.cu_other_rural_base || 0) : 0;
-
-          const usd = base + rate * (Number(weight) || 0);
-          const minFee = Number(row.cu_min_fee || 0);
-          cents = toCents(Math.max(usd, minFee));
+          const usd = Math.max(base + rate * (Number(weight) || 0), Number(row.cu_min_fee || 0));
+          cents = toCents(usd);
         } else {
           mode = 'fixed';
           const usd =
@@ -136,8 +123,13 @@ router.post('/quote', authenticateToken, async (req, res) => {
             zoneKey === 'habana_municipio'     ? Number(row.cu_hab_rural_flat || 0) :
             zoneKey === 'provincias_city'      ? Number(row.cu_other_city_flat || 0) :
             zoneKey === 'provincias_municipio' ? Number(row.cu_other_rural_flat || 0) : 0;
-
           cents = toCents(usd);
+        }
+
+        const thr = Number(row.over_thr_lbs || 0);
+        const fee = Number(row.over_fee_usd || 0);
+        if (thr > 0 && fee > 0 && Number(weight) > thr) {
+          cents += toCents(fee);
         }
       }
 
@@ -145,6 +137,7 @@ router.post('/quote', authenticateToken, async (req, res) => {
         owner_id: ownerId,
         owner_name: ownerName,
         mode,
+        transport: transport,
         weight_lb: Number.isFinite(weight) ? Number(weight.toFixed(2)) : 0,
         shipping_cents: cents,
       });
@@ -164,6 +157,7 @@ router.post('/quote', authenticateToken, async (req, res) => {
     return res.json({
       ok: true,
       country,
+      transport,
       zone: zoneKey,
       shipping_total_cents: totalCents,
       breakdown,
@@ -175,6 +169,5 @@ router.post('/quote', authenticateToken, async (req, res) => {
     client.release();
   }
 });
-
 
 module.exports = router;
