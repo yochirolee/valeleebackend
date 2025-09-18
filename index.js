@@ -110,6 +110,7 @@ app.use(maintenanceGuard({
     '/login',
     '/customers/me',
     '/payments',
+    /^\/checkout-sessions(\/|$)/, 
   ],
 }))
 
