@@ -12,6 +12,9 @@ const { ownersRouter, ownersPublicRouter } = require('./routes/owners')
 const ownerAreasRouter = require('./routes/ownerAreas')
 const shippingRouter = require('./routes/shipping')
 const recipientsRouter = require('./routes/recipients')
+const maintenanceGuard = require('./middleware/maintenance')
+const adminMaintenanceRouter = require('./routes/admin_maintenance')
+const { getMode } = require('./state/maintenanceState')
 
 // routers por funcionalidad
 const productsRouter = require('./routes/products')
@@ -85,7 +88,31 @@ app.use('/uploads', express.static(UPLOAD_DIR, {
 
 // Health & raíz
 app.get('/', (_req, res) => res.send('¡Tu backend con Express está funcionando! 🚀'))
-app.get('/health', (_req, res) => res.json({ ok: true }))
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, maintenance: { mode: getMode() } })
+})
+
+//Mantenimiento
+app.use('/admin/maintenance', adminMaintenanceRouter)
+// 🔒 Guard de mantenimiento — coloca ANTES de montar el resto de rutas
+app.use(maintenanceGuard({
+  // Rutas que se permiten incluso en mantenimiento TOTAL (p. ej. health y webhooks)
+  allowFull: [
+    '/health',
+    '/login',
+    '/customers/me',
+    '/payments',
+  ],
+
+  // Rutas públicas de auth que deben funcionar para poder entrar como admin
+  allowAuth: [
+    '/health',
+    '/login',
+    '/customers/me',
+    '/payments',
+  ],
+}))
+
 
 // === Montaje de rutas existentes ===
 app.use('/checkout', authenticateToken, checkoutRoutes)   // protegida
