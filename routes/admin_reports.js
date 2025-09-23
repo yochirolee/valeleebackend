@@ -332,23 +332,23 @@ router.post('/payouts/close', authenticateToken, requireAdmin, async (req, res) 
     const { rows: a } = await client.query(aggSql, [ids])
     const agg = a[0]
     const amount_to_owner_cents = Number(agg.base_cents) + Number(agg.duty_cents) + Number(agg.shipping_owner_cents)
-
     // crea lote
     const ins = await client.query(
       `INSERT INTO owner_payouts
-        (owner_id, from_date, to_date, tz, delivered_only,
-         orders_count, items_count, base_cents, shipping_owner_cents,
-         amount_to_owner_cents, margin_cents, gateway_fee_cents,
-         created_by, note, duty_cents)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-       RETURNING id`,
+      (owner_id, from_date, to_date, tz, delivered_only,
+      orders_count, items_count, base_cents, shipping_owner_cents,
+      amount_to_owner_cents, margin_cents, gateway_fee_cents,
+      created_by, note, duty_cents)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      RETURNING id`,
       [
         ownerId, from, to, tz, !!delivered_only,
         agg.orders_count, agg.items_count, agg.base_cents, agg.shipping_owner_cents,
-        amount_to_owner_cents, agg.margin_cents, agg.gateway_fee_cents, agg.duty_cents
-        (req.user && req.user.email) || null, note || null
+        amount_to_owner_cents, Number(agg.margin_cents), Number(agg.gateway_fee_cents),
+        (req.user && req.user.email) || null, note || null, Number(agg.duty_cents)
       ]
     )
+
     const payoutId = ins.rows[0].id
 
     // marca órdenes
