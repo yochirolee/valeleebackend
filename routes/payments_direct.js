@@ -240,29 +240,55 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
         };
       }
 
-      // precios de venta (con margen y tax por item) ya los calculabas
-      const uc = unitCents({ unit_price: it.unit_price, metadata: it.cart_item_metadata });
-      const tc = taxCentsPerItem({ metadata: it.cart_item_metadata });
+      // precios de venta (con margen) ya los calculabas
+      const cim = it.cart_item_metadata || {};
+      const uc = unitCents({ unit_price: it.unit_price, metadata: cim }); // cents
+      const tc = taxCentsPerItem({ metadata: cim });                      // cents
       const qty = Number(it.quantity);
 
-      // SNAPSHOT de costos del producto (base y margen al momento de la orden)
-      const base_cents_snapshot = baseCentsFromProduct(it.product_metadata, it.product_price);
-      const margin_pct_snapshot = marginPctFromProduct(it.product_metadata);
+      // SNAPSHOT de costos del producto (preferir carrito si lo trae)
+      const base_cents_snapshot = Number.isInteger(cim.base_cents)
+        ? Number(cim.base_cents)
+        : baseCentsFromProduct(it.product_metadata, it.product_price);
 
+      const margin_pct_snapshot = Number.isFinite(Number(cim.margin_pct))
+        ? Number(cim.margin_pct)
+        : marginPctFromProduct(it.product_metadata);
+
+      // Usamos el snapshot del carrito si viene; si no, el uc que ya calculaste
+      const unit_cents_snapshot = Number.isInteger(cim.unit_cents_snapshot)
+        ? Number(cim.unit_cents_snapshot)
+        : uc;
+
+      // duty: si viene directo del carrito, úsalo; si no, lo derivamos:
+      // duty = round(unit / (1 + margin_pct/100)) - base   (truncate a >= 0)
+      const duty_cents_snapshot = Number.isInteger(cim.duty_cents)
+        ? Number(cim.duty_cents)
+        : (margin_pct_snapshot >= 0
+          ? Math.max(
+            Math.round(unit_cents_snapshot / (1 + (margin_pct_snapshot / 100))) - base_cents_snapshot,
+            0
+          )
+          : 0);
+
+      // acumular totales por owner
       groupsByOwner[key].subtotal_cents += uc * qty;
       groupsByOwner[key].tax_cents += tc * qty;
       groupsByOwner[key].owner_base_subtotal_cents += base_cents_snapshot * qty;
 
+      // guardar snapshots por ítem (los usaremos al insertar line_items)
       groupsByOwner[key].items.push({
         product_id: it.product_id,
         quantity: qty,
-        unit_cents: uc,
-        tax_cents: tc,
+        unit_cents: uc,             
+        tax_cents: tc,                
         title: it.title,
-        // snapshots que vamos a guardar en line_items.metadata
         base_cents_snapshot,
-        margin_pct_snapshot
+        margin_pct_snapshot,
+        unit_cents_snapshot,          
+        duty_cents: duty_cents_snapshot 
       });
+
     }
 
     const transport =
@@ -488,10 +514,13 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
 
       for (const it of g.items) {
         const lineMeta = {
-          base_cents: it.base_cents_snapshot,         // snapshot del costo base
-          margin_pct: it.margin_pct_snapshot,         // snapshot del margen del producto
-          unit_cents_snapshot: it.unit_cents,         // (opcional) por si quieres ver lo vendido sin tax, en cents
-          tax_cents_snapshot: it.tax_cents            // (opcional)
+          base_cents: it.base_cents_snapshot,          // snapshot del costo base
+          margin_pct: it.margin_pct_snapshot,          // snapshot del margen
+          unit_cents_snapshot: it.unit_cents_snapshot, // precio vendido (snapshot)
+          tax_cents_snapshot: it.tax_cents,            // opcional (ya lo tenías)
+          duty_cents: it.duty_cents,                   // <-- NUEVO
+          // opcionalmente deja también el precio con margen explícito:
+          price_with_margin_cents: it.unit_cents_snapshot
         };
 
         await client.query(
@@ -501,7 +530,7 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
             orderId,
             it.product_id,
             Number(it.quantity),
-            Number((it.unit_cents / 100).toFixed(2)),  // unit_price USD (como ya hacías)
+            Number((it.unit_cents / 100).toFixed(2)), // unit_price en USD (como antes)
             JSON.stringify(lineMeta)
           ]
         );

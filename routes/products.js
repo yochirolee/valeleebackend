@@ -5,7 +5,26 @@ const authenticateToken = require('../middleware/authenticateToken')
 const { requireAdmin } = require('../middleware/roles')
 const { zoneKeyForCuba } = require('../utils/geo')
 
-// LIST + filtros (incluye lógica de shipping/zonas)
+/* ============================
+   Helpers nuevos (no rompen nada)
+   ============================ */
+function parseDutyCents(body) {
+  const u = Number(body?.duty_usd)
+  if (Number.isFinite(u) && u >= 0) return Math.round(u * 100)
+  const c = Number(body?.duty_cents)
+  if (Number.isInteger(c) && c >= 0) return c
+  return 0
+}
+function parseKeywords(body) {
+  const raw = body?.keywords
+  let arr = Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.split(',') : [])
+  const out = Array.from(new Set(arr.map(s => String(s).trim().toLowerCase()).filter(Boolean)))
+  return out.slice(0, 50)
+}
+
+/* ============================================================
+   LIST + filtros (incluye lógica de shipping/zonas) (GET /products)
+   ============================================================ */
 router.get('/products', async (req, res) => {
   const {
     category_id,
@@ -94,7 +113,11 @@ router.get('/products', async (req, res) => {
 
     const sql = `
       WITH src AS (
-        SELECT id, title, description, price, weight, category_id, image_url, metadata, stock_qty, owner_id
+        SELECT
+          id, title, description, title_en, description_en,
+          price, weight, category_id, image_url,
+          metadata, stock_qty, owner_id,
+          duty_cents, keywords
         FROM products
         ${whereSql}
       ),
@@ -102,33 +125,42 @@ router.get('/products', async (req, res) => {
         SELECT
           *,
           COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) AS base_cents,
-          COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)          AS margin_pct,
+          COALESCE(duty_cents, 0)                                          AS duty_cents_safe,
+          COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)         AS margin_pct,
           CASE
             WHEN jsonb_typeof(metadata->'taxable')='boolean' THEN (metadata->>'taxable')::boolean
             WHEN jsonb_typeof(metadata->'taxable')='string'  THEN lower(metadata->>'taxable') IN ('true','t','yes','1')
             ELSE true
           END AS taxable,
-          COALESCE(NULLIF(metadata->>'tax_pct','')::numeric, 0) AS tax_pct
+          COALESCE(NULLIF(metadata->>'tax_pct','')::numeric, 0)            AS tax_pct,
+          (COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) + COALESCE(duty_cents,0)) AS effective_cents
         FROM src
       )
       SELECT
-        id, title, description, price, weight, category_id, image_url, metadata, stock_qty, owner_id,
-        ROUND(base_cents * (100 + margin_pct) / 100.0)::int                                AS price_with_margin_cents,
+        id, title, description, title_en, description_en,
+        price, weight, category_id, image_url,
+        metadata, stock_qty, owner_id,
+        duty_cents, keywords,
+
+        ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
+
         CASE WHEN taxable
-             THEN ROUND((base_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
-             ELSE 0 END                                                                    AS tax_cents,
-        (ROUND(base_cents * (100 + margin_pct) / 100.0)::int
+             THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
+             ELSE 0 END                                          AS tax_cents,
+
+        (ROUND(effective_cents * (100 + margin_pct) / 100.0)::int
           + CASE WHEN taxable
-                 THEN ROUND((base_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
-                 ELSE 0 END)                                                               AS display_total_cents,
+                 THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
+                 ELSE 0 END)                                     AS display_total_cents,
+
         ROUND(
           (
-            ROUND(base_cents * (100 + margin_pct) / 100.0)::numeric
+            ROUND(effective_cents * (100 + margin_pct) / 100.0)::numeric
             + CASE WHEN taxable
-                   THEN ROUND((base_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::numeric
+                   THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::numeric
                    ELSE 0 END
           ) / 100.0
-        , 2)                                                                               AS display_total_usd
+        , 2)                                                     AS display_total_usd
       FROM calc
       ORDER BY id DESC;
     `;
@@ -141,7 +173,9 @@ router.get('/products', async (req, res) => {
   }
 });
 
-// BEST SELLERS
+/* ===================
+   BEST SELLERS
+   =================== */
 router.get('/products/best-sellers', async (req, res) => {
   const {
     limit = '12',
@@ -226,7 +260,9 @@ router.get('/products/best-sellers', async (req, res) => {
          GROUP BY li.product_id
       ),
       src AS (
-        SELECT p.id, p.title, p.description, p.price, p.weight, p.category_id, p.image_url, p.metadata, p.stock_qty,
+        SELECT p.id, p.title, p.description, p.title_en, p.description_en,
+               p.price, p.weight, p.category_id, p.image_url, p.metadata, p.stock_qty,
+               p.owner_id, p.duty_cents, p.keywords,
                COALESCE(r.sold_qty, 0) AS sold_qty
           FROM products p
           LEFT JOIN recent r ON r.product_id = p.id
@@ -243,14 +279,18 @@ router.get('/products/best-sellers', async (req, res) => {
         SELECT
           *,
           COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) AS base_cents,
-          COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)          AS margin_pct
+          COALESCE(duty_cents, 0)                                          AS duty_cents_safe,
+          COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)         AS margin_pct,
+          (COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) + COALESCE(duty_cents,0)) AS effective_cents
         FROM src
       )
       SELECT
-        id, title, description, price, weight, category_id, image_url, metadata, stock_qty,
+        id, title, description, title_en, description_en,
+        price, weight, category_id, image_url, metadata, stock_qty,
+        owner_id, duty_cents, keywords,
         sold_qty,
-        ROUND(base_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
-        ROUND(ROUND(base_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd
+        ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
+        ROUND(ROUND(effective_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd
       FROM calc
       ORDER BY sold_qty DESC, id DESC
       LIMIT ${lim};
@@ -264,7 +304,9 @@ router.get('/products/best-sellers', async (req, res) => {
   }
 });
 
-// SEARCH
+/* ===================
+   SEARCH
+   =================== */
 router.get('/products/search', async (req, res) => {
   const {
     q = '',
@@ -345,9 +387,22 @@ router.get('/products/search', async (req, res) => {
 
     const text = String(q).trim();
     if (text) {
-      params.push(`%${text}%`); const i1 = params.length;
-      params.push(`%${text}%`); const i2 = params.length;
-      where.push(`(p.title ILIKE $${i1} OR p.description ILIKE $${i2})`);
+      params.push(`%${text}%`); const i1 = params.length; // title es
+      params.push(`%${text}%`); const i2 = params.length; // description es
+      params.push(`%${text}%`); const i3 = params.length; // title en
+      params.push(`%${text}%`); const i4 = params.length; // description en
+      params.push(`%${text}%`); const i5 = params.length; // keywords like
+
+      where.push(`(
+        p.title ILIKE $${i1}
+        OR p.description ILIKE $${i2}
+        OR p.title_en ILIKE $${i3}
+        OR p.description_en ILIKE $${i4}
+        OR EXISTS (
+          SELECT 1 FROM unnest(COALESCE(p.keywords, '{}')) kw
+          WHERE kw ILIKE $${i5}
+        )
+      )`);
     }
 
     where.push(`COALESCE(
@@ -364,8 +419,10 @@ router.get('/products/search', async (req, res) => {
     const sql = `
       WITH src AS (
         SELECT
-          p.id, p.title, p.description, p.price, p.weight, p.category_id,
-          p.image_url, p.metadata, p.stock_qty
+          p.id, p.title, p.description, p.title_en, p.description_en,
+          p.price, p.weight, p.category_id,
+          p.image_url, p.metadata, p.stock_qty, p.owner_id,
+          p.duty_cents, p.keywords
         FROM products p
         ${whereSql}
         ORDER BY p.id DESC
@@ -375,13 +432,17 @@ router.get('/products/search', async (req, res) => {
         SELECT
           *,
           COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) AS base_cents,
-          COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)          AS margin_pct
+          COALESCE(duty_cents, 0)                                          AS duty_cents_safe,
+          COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)         AS margin_pct,
+          (COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) + COALESCE(duty_cents,0)) AS effective_cents
         FROM src
       )
       SELECT
-        id, title, description, price, weight, category_id, image_url, metadata, stock_qty,
-        ROUND(base_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
-        ROUND(ROUND(base_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd
+        id, title, description, title_en, description_en,
+        price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+        duty_cents, keywords,
+        ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
+        ROUND(ROUND(effective_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd
       FROM calc;
     `;
 
@@ -396,11 +457,17 @@ router.get('/products/search', async (req, res) => {
   }
 });
 
-// GET by id
+/* ===================
+   GET by id
+   =================== */
 router.get('/products/:id', async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, title, description, price, weight, category_id, image_url, metadata, stock_qty, owner_id FROM products WHERE id = $1',
+      `SELECT id, title, description, title_en, description_en,
+              price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+              duty_cents, keywords
+         FROM products
+        WHERE id = $1`,
       [req.params.id]
     )
     if (!result.rows.length) return res.status(404).send('Producto no encontrado')
@@ -411,9 +478,14 @@ router.get('/products/:id', async (req, res) => {
   }
 })
 
-// CREATE (admin)
+/* ===================
+   CREATE (admin)
+   =================== */
 router.post('/products', authenticateToken, requireAdmin, async (req, res) => {
-  const { title, price, weight, category_id, image_url, description, stock_qty, owner_id } = req.body
+  const {
+    title, price, weight, category_id, image_url, description, stock_qty, owner_id,
+    title_en, description_en
+  } = req.body
   if (!title || price == null) return res.status(400).json({ error: 'title y price son requeridos' })
 
   const rawMeta = req.body?.metadata ?? {}
@@ -427,21 +499,36 @@ router.post('/products', authenticateToken, requireAdmin, async (req, res) => {
   }
   Object.keys(cleanMeta).forEach(k => cleanMeta[k] === undefined && delete cleanMeta[k])
 
+  // nuevos
+  const dutyCents = parseDutyCents(req.body)
+  const keywords = parseKeywords(req.body)
+
   try {
     const result = await pool.query(
-      `INSERT INTO products (title, description, price, weight, category_id, image_url, metadata, stock_qty, owner_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      RETURNING id, title, description, price, weight, category_id, image_url, metadata, stock_qty, owner_id`,
+      `INSERT INTO products (
+         title, description, title_en, description_en,
+         price, weight, category_id, image_url,
+         metadata, stock_qty, owner_id,
+         duty_cents, keywords
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       RETURNING id, title, description, title_en, description_en,
+                 price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+                 duty_cents, keywords`,
       [
         String(title).trim(),
         description || null,
+        title_en ? String(title_en).trim() : null,
+        description_en || null,
         price,
         weight || null,
         category_id || null,
         image_url || null,
         JSON.stringify(cleanMeta),
         Number.isInteger(Number(stock_qty)) ? Number(stock_qty) : 0,
-        (Number.isInteger(Number(owner_id)) ? Number(owner_id) : null)
+        (Number.isInteger(Number(owner_id)) ? Number(owner_id) : null),
+        dutyCents,
+        keywords.length ? keywords : null,
       ]
     )
     res.status(201).json(result.rows[0])
@@ -451,9 +538,15 @@ router.post('/products', authenticateToken, requireAdmin, async (req, res) => {
   }
 })
 
-// UPDATE (admin)
+/* ===================
+   UPDATE (admin)
+   =================== */
 router.put('/products/:id', authenticateToken, requireAdmin, async (req, res) => {
-  const { title, price, weight, category_id, image_url, description, stock_qty, owner_id } = req.body
+  const {
+    title, price, weight, category_id, image_url, description, stock_qty, owner_id,
+    title_en, description_en
+  } = req.body
+
   const rawMeta = req.body?.metadata ?? {}
   const cleanMeta = {
     owner: typeof rawMeta.owner === 'string' ? rawMeta.owner.trim() : undefined,
@@ -468,20 +561,30 @@ router.put('/products/:id', authenticateToken, requireAdmin, async (req, res) =>
   const stockInt = (stock_qty === '' || stock_qty == null) ? null : Number(stock_qty)
   const ownerInt = (owner_id === '' || owner_id == null) ? null : Number(owner_id)
 
+  // nuevos
+  const dutyCents = parseDutyCents(req.body)
+  const keywords = parseKeywords(req.body)
+
   try {
     const q = `
       UPDATE products
-         SET title       = COALESCE($1, title),
-             description = COALESCE($2, description),
-             price       = COALESCE($3, price),
-             weight      = COALESCE($4, weight),
-             category_id = COALESCE($5, category_id),
-             image_url   = COALESCE($6, image_url),
-             metadata    = COALESCE(metadata,'{}'::jsonb) || COALESCE($7::jsonb,'{}'::jsonb),
-             stock_qty   = COALESCE($8::int, stock_qty),
-             owner_id    = COALESCE($9::int, owner_id)
-       WHERE id = $10::int
-   RETURNING id, title, description, price, weight, category_id, image_url, metadata, stock_qty, owner_id
+         SET title          = COALESCE($1, title),
+             description    = COALESCE($2, description),
+             price          = COALESCE($3, price),
+             weight         = COALESCE($4, weight),
+             category_id    = COALESCE($5, category_id),
+             image_url      = COALESCE($6, image_url),
+             metadata       = COALESCE(metadata,'{}'::jsonb) || COALESCE($7::jsonb,'{}'::jsonb),
+             stock_qty      = COALESCE($8::int, stock_qty),
+             owner_id       = COALESCE($9::int, owner_id),
+             title_en       = COALESCE($10, title_en),
+             description_en = COALESCE($11, description_en),
+             duty_cents     = COALESCE($12, duty_cents),
+             keywords       = COALESCE($13::text[], keywords)
+       WHERE id = $14::int
+   RETURNING id, title, description, title_en, description_en,
+             price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+             duty_cents, keywords
     `;
     const params = [
       title ?? null,
@@ -493,6 +596,10 @@ router.put('/products/:id', authenticateToken, requireAdmin, async (req, res) =>
       JSON.stringify(cleanMeta),
       stockInt,
       ownerInt,
+      title_en ? String(title_en).trim() : null,
+      description_en ?? null,
+      dutyCents,
+      (keywords.length ? keywords : null),
       Number(req.params.id),
     ];
 
@@ -505,7 +612,9 @@ router.put('/products/:id', authenticateToken, requireAdmin, async (req, res) =>
   }
 })
 
-// DELETE (admin, con lógica de archivar si tiene órdenes)
+/* ===================
+   DELETE (admin, con lógica de archivar si tiene órdenes)
+   =================== */
 router.delete('/products/:id', authenticateToken, requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   try {
@@ -532,7 +641,9 @@ router.delete('/products/:id', authenticateToken, requireAdmin, async (req, res)
   }
 })
 
-// DELETE/ARCHIVE admin back-compat
+/* ===================
+   DELETE/ARCHIVE admin back-compat
+   =================== */
 router.delete('/admin/products/:id', authenticateToken, requireAdmin, async (req, res) => {
   const client = await pool.connect()
   const id = Number(req.params.id)
@@ -566,7 +677,9 @@ router.delete('/admin/products/:id', authenticateToken, requireAdmin, async (req
   }
 })
 
-// ADMIN list
+/* ===================
+   ADMIN list
+   =================== */
 router.get('/admin/products', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { q = '', page = '1', limit = '12', category_id, owner_id, archived = 'all' } = req.query
@@ -577,7 +690,7 @@ router.get('/admin/products', authenticateToken, requireAdmin, async (req, res) 
     const where = []
     const vals = []
 
-    if (q) { vals.push(`%${q}%`); where.push(`title ILIKE $${vals.length}`) }
+    if (q) { vals.push(`%${q}%`); where.push(`(title ILIKE $${vals.length} OR title_en ILIKE $${vals.length} OR EXISTS (SELECT 1 FROM unnest(COALESCE(keywords,'{}')) kw WHERE kw ILIKE $${vals.length}))`) }
     if (category_id) { vals.push(Number(category_id)); where.push(`category_id = $${vals.length}`) }
     if (owner_id != null && owner_id !== '' && !Number.isNaN(Number(owner_id))) {
       vals.push(Number(owner_id)); where.push(`owner_id = $${vals.length}`)
@@ -587,7 +700,9 @@ router.get('/admin/products', authenticateToken, requireAdmin, async (req, res) 
 
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
     const sql = `
-      SELECT id, title, description, price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+      SELECT id, title, description, title_en, description_en,
+             price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+             duty_cents, keywords,
              COUNT(*) OVER() AS total
       FROM products
       ${whereSql}
@@ -610,7 +725,9 @@ router.get('/admin/products', authenticateToken, requireAdmin, async (req, res) 
   }
 })
 
-// CATEGORY → PRODUCTS
+/* ===================
+   CATEGORY → PRODUCTS
+   =================== */
 router.get('/products/category/:slug', async (req, res) => {
   const { slug } = req.params;
   const { country, province, area_type, municipality } = req.query;
@@ -683,7 +800,9 @@ router.get('/products/category/:slug', async (req, res) => {
 
     const sql = `
       WITH src AS (
-        SELECT id, title, description, price, weight, category_id, image_url, metadata, stock_qty
+        SELECT id, title, description, title_en, description_en,
+               price, weight, category_id, image_url, metadata, stock_qty,
+               owner_id, duty_cents, keywords
         FROM products p
         WHERE p.category_id = $1
           AND COALESCE(
@@ -701,13 +820,17 @@ router.get('/products/category/:slug', async (req, res) => {
         SELECT
           *,
           COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) AS base_cents,
-          COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)          AS margin_pct
+          COALESCE(duty_cents, 0)                                          AS duty_cents_safe,
+          COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)         AS margin_pct,
+          (COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) + COALESCE(duty_cents,0)) AS effective_cents
         FROM src
       )
       SELECT
-        id, title, description, price, weight, category_id, image_url, metadata, stock_qty,
-        ROUND(base_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
-        ROUND(ROUND(base_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd
+        id, title, description, title_en, description_en,
+        price, weight, category_id, image_url, metadata, stock_qty,
+        owner_id, duty_cents, keywords,
+        ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
+        ROUND(ROUND(effective_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd
       FROM calc
       ORDER BY id DESC;
     `;

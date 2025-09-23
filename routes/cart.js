@@ -97,25 +97,81 @@ router.get('/cart', authenticateToken, async (req, res) => {
     if (!cartRes.rows.length) return res.json({ cart: null, items: [] });
     const cart = cartRes.rows[0];
     const itemsRes = await pool.query(
-      `SELECT
-        ci.id,
-        ci.product_id,
-        ci.quantity,
-        ci.unit_price,
-        ci.metadata,
-        p.title                       AS title,
-        p.image_url                   AS thumbnail,
-        COALESCE(p.weight, 0)::float  AS weight,
-        p.owner_id                    AS owner_id,
-        o.name                        AS owner_name,
-        COALESCE(p.stock_qty, 0)::int AS available_stock
-      FROM cart_items ci
-      LEFT JOIN products p ON p.id = ci.product_id
-      LEFT JOIN owners   o ON o.id = p.owner_id
-      WHERE ci.cart_id = $1
-      ORDER BY ci.id ASC;`,
+      `
+      SELECT
+          ci.id,
+          ci.product_id,
+          ci.quantity,
+          ci.unit_price,
+
+          /* metadata enriquecida (right wins en ||) */
+          COALESCE(ci.metadata, '{}'::jsonb)
+            || jsonb_build_object(
+                /* duty: si el del item es >0 úsalo; si no, usa el del producto (columna o metadata); si no, 0 */
+                'duty_cents',
+                CASE
+                  WHEN NULLIF(ci.metadata->>'duty_cents','') IS NOT NULL
+                        AND (ci.metadata->>'duty_cents')::int > 0
+                    THEN (ci.metadata->>'duty_cents')::int
+                  WHEN p.duty_cents IS NOT NULL AND p.duty_cents > 0
+                    THEN p.duty_cents::int
+                  WHEN jsonb_typeof(p.metadata->'duty_cents') = 'number'
+                        AND (p.metadata->>'duty_cents')::int > 0
+                    THEN (p.metadata->>'duty_cents')::int
+                  ELSE 0
+                END,
+
+                /* title_en */
+                'title_en',
+                COALESCE(
+                  NULLIF(ci.metadata->>'title_en',''),
+                  NULLIF(p.title_en,''),
+                  CASE WHEN jsonb_typeof(p.metadata->'title_en') = 'string'
+                        THEN NULLIF(p.metadata->>'title_en','') END
+                ),
+
+                /* description_en */
+                'description_en',
+                COALESCE(
+                  NULLIF(ci.metadata->>'description_en',''),
+                  NULLIF(p.description_en,''),
+                  CASE WHEN jsonb_typeof(p.metadata->'description_en') = 'string'
+                        THEN NULLIF(p.metadata->>'description_en','') END
+                )
+              ) AS metadata,
+
+          /* Campos existentes */
+          p.title                       AS title,
+          p.image_url                   AS thumbnail,
+
+          /* Top-level para que el front pueda leerlos directo si quiere */
+          COALESCE(
+            NULLIF(ci.metadata->>'title_en',''),
+            NULLIF(p.title_en,''),
+            CASE WHEN jsonb_typeof(p.metadata->'title_en') = 'string'
+                THEN NULLIF(p.metadata->>'title_en','') END
+          ) AS title_en,
+
+          COALESCE(
+            NULLIF(ci.metadata->>'description_en',''),
+            NULLIF(p.description_en,''),
+            CASE WHEN jsonb_typeof(p.metadata->'description_en') = 'string'
+                THEN NULLIF(p.metadata->>'description_en','') END
+          ) AS description_en,
+
+          COALESCE(p.weight, 0)::float  AS weight,
+          p.owner_id                    AS owner_id,
+          o.name                        AS owner_name,
+          COALESCE(p.stock_qty, 0)::int AS available_stock
+
+        FROM cart_items ci
+        LEFT JOIN products p ON p.id = ci.product_id
+        LEFT JOIN owners   o ON o.id = p.owner_id
+        WHERE ci.cart_id = $1
+        ORDER BY ci.id ASC;`,
       [cart.id]
     );
+
     res.json({ cart, items: itemsRes.rows });
   } catch (error) {
     console.error(error);
@@ -143,7 +199,7 @@ router.post('/cart/add', authenticateToken, async (req, res) => {
     const cartId = cart.rows[0].id
 
     const prodRes = await pool.query(
-      'SELECT id, title, price, metadata, COALESCE(stock_qty,0)::int AS stock_qty FROM products WHERE id = $1',
+      'SELECT  id, title, title_en, description_en, price, duty_cents, metadata, COALESCE(stock_qty,0)::int AS stock_qty FROM products WHERE id = $1',
       [product_id]
     )
     if (!prodRes.rows.length) return res.status(404).json({ error: 'Producto no encontrado' })
@@ -186,45 +242,83 @@ router.post('/cart/add', authenticateToken, async (req, res) => {
       })
     }
 
-    const taxable = m.taxable !== false
-    const tax_pct = Number.isFinite(m.tax_pct) ? Math.max(0, Math.min(30, Number(m.tax_pct))) : 0
-    const margin_pct = Number.isFinite(m.margin_pct) ? Math.max(0, Number(m.margin_pct)) : 0
+    const taxable = m.taxable !== false;
+    const tax_pct = Number.isFinite(m.tax_pct) ? Math.max(0, Math.min(30, Number(m.tax_pct))) : 0;
+    const margin_pct = Number.isFinite(m.margin_pct) ? Math.max(0, Number(m.margin_pct)) : 0;
 
+    /* base en centavos */
     const base_cents = Number.isInteger(m.price_cents) && m.price_cents >= 0
       ? m.price_cents
-      : Math.round(Number(prod.price) * 100)
+      : Math.round(Number(prod.price) * 100);
 
-    const price_with_margin_cents = Math.round(base_cents * (100 + margin_pct) / 100)
-    const tax_cents = taxable ? Math.round(price_with_margin_cents * tax_pct / 100) : 0
+    /* duty: preferir columna top-level, luego metadata */
+    let duty_cents = 0;
+    if (Number.isFinite(prod.duty_cents)) {
+      duty_cents = Math.max(0, Number(prod.duty_cents));
+    } else if (Number.isInteger(m.duty_cents)) {
+      duty_cents = Math.max(0, Number(m.duty_cents));
+    } else if (typeof m.duty_cents === 'string' && m.duty_cents.trim() !== '') {
+      const parsed = parseInt(m.duty_cents, 10);
+      duty_cents = Number.isInteger(parsed) ? Math.max(0, parsed) : 0;
+    }
 
-    const unit_price_usd = (price_with_margin_cents / 100).toFixed(2)
+    /* Precio + Arancel + Ganancia */
+    const base_plus_duty_cents = base_cents + duty_cents;
+    const price_with_margin_cents = Math.round(base_plus_duty_cents * (100 + margin_pct) / 100);
 
-    const itemMeta = {
+    /* Impuesto */
+    const tax_cents = taxable ? Math.round(price_with_margin_cents * tax_pct / 100) : 0;
+
+    /* unit_price en USD para la tabla */
+    const unit_price_usd = (price_with_margin_cents / 100).toFixed(2);
+
+    /* textos en-: preferir columnas top-level, luego metadata */
+    const title_en =
+      typeof prod.title_en === 'string' && prod.title_en.trim()
+        ? prod.title_en.trim()
+        : (typeof m.title_en === 'string' && m.title_en.trim() ? m.title_en.trim() : undefined);
+
+    const description_en =
+      typeof prod.description_en === 'string' && prod.description_en.trim()
+        ? prod.description_en.trim()
+        : (typeof m.description_en === 'string' && m.description_en.trim() ? m.description_en.trim() : undefined);
+
+    /* metadata del ítem (merge) */
+    const itemMetaBase = {
       price_source: (Number.isInteger(m.price_cents) ? 'price_cents' : 'price'),
       base_cents,
+      duty_cents,
       margin_pct,
       taxable,
       tax_pct,
       price_with_margin_cents,
       tax_cents,
       computed_at: new Date().toISOString(),
-    }
+    };
+    const itemMeta = {
+      ...itemMetaBase,
+      ...(title_en ? { title_en } : {}),
+      ...(description_en ? { description_en } : {}),
+    };
+
+    /* UPDATE/INSERT como ya lo tienes (|| sobrescribe keys antiguas) */
+
 
     if (existing.rows.length > 0) {
       await pool.query(
         `UPDATE cart_items
-           SET quantity = quantity + $1,
-               unit_price = $2,
-               metadata = COALESCE(metadata,'{}'::jsonb) || $3::jsonb
-         WHERE cart_id = $4 AND product_id = $5`,
+        SET quantity = quantity + $1,
+            unit_price = $2,
+            metadata = COALESCE(metadata,'{}'::jsonb) || $3::jsonb
+      WHERE cart_id = $4 AND product_id = $5`,
         [quantity, unit_price_usd, JSON.stringify(itemMeta), cartId, product_id]
-      )
+      );
     } else {
       await pool.query(
         `INSERT INTO cart_items (cart_id, product_id, quantity, unit_price, metadata)
-         VALUES ($1, $2, $3, $4, $5)`,
+     VALUES ($1, $2, $3, $4, $5)`,
         [cartId, product_id, quantity, unit_price_usd, JSON.stringify(itemMeta)]
-      )
+      );
     }
 
     return res.json({
@@ -234,7 +328,8 @@ router.post('/cart/add', authenticateToken, async (req, res) => {
       quantity_added: quantity,
       unit_price: Number(unit_price_usd),
       tax_cents
-    })
+    });
+
   } catch (error) {
     console.error(error)
     return res.status(500).json({ error: 'Error al agregar al carrito' })

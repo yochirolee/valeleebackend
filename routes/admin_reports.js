@@ -15,7 +15,7 @@ router.get('/payouts', authenticateToken, requireAdmin, async (req, res) => {
     const ownerId = req.query.owner_id != null && req.query.owner_id !== ''
       ? Number(req.query.owner_id)
       : null
-    const deliveredOnly = ['1', 'true', 'yes', 'on'].includes(String(req.query.delivered_only || '1').toLowerCase())
+    const deliveredOnly = ['1', 'true', 'yes', 'on'].includes(String(req.query.delivered_only || '0').toLowerCase())
 
     // --------- SQL principal ----------
     // NOTAS:
@@ -59,17 +59,23 @@ orders_filt AS (
           li.order_id,
           SUM(li.quantity)::int AS items_count,
           SUM( COALESCE((li.metadata->>'base_cents')::int, 0) * li.quantity )::int AS base_cents,
-          -- margen por línea (unit - base). Si falta unit, fallback a base*margin_pct/100.
-          SUM(
-            CASE
-              WHEN COALESCE((li.metadata->>'unit_cents_snapshot')::int, 0) > 0
-                THEN ( (COALESCE((li.metadata->>'unit_cents_snapshot')::int, 0)
-                      - COALESCE((li.metadata->>'base_cents')::int, 0)) * li.quantity )
-              ELSE ( ROUND( COALESCE((li.metadata->>'base_cents')::int, 0)
-                           * COALESCE(NULLIF(li.metadata->>'margin_pct','')::numeric, 0) / 100.0 )::int * li.quantity )
-            END
-          )::int AS margin_cents,
-          SUM( COALESCE((li.metadata->>'tax_cents_snapshot')::int, 0) * li.quantity )::int AS tax_cents
+          -- NUEVO: aranceles (duty) por línea
+      SUM( COALESCE((li.metadata->>'duty_cents')::int, 0) * li.quantity )::int        AS duty_cents,
+      -- margen por línea EXCLUYENDO aranceles: (unit - base - duty).
+      SUM(
+        CASE
+          WHEN COALESCE((li.metadata->>'unit_cents_snapshot')::int, 0) > 0 THEN
+            (
+              ( COALESCE((li.metadata->>'unit_cents_snapshot')::int, 0)
+              - COALESCE((li.metadata->>'base_cents')::int, 0)
+              - COALESCE((li.metadata->>'duty_cents')::int, 0)
+              ) * li.quantity
+            )
+          ELSE
+            ( ROUND( COALESCE((li.metadata->>'base_cents')::int, 0) * COALESCE(NULLIF(li.metadata->>'margin_pct','')::numeric, 0) / 100.0 )::int * li.quantity )
+        END
+      )::int                                                                          AS margin_cents,
+      SUM( COALESCE((li.metadata->>'tax_cents_snapshot')::int, 0) * li.quantity )::int AS tax_cents
         FROM line_items li
         JOIN orders_filt o ON o.id = li.order_id
         GROUP BY o.owner_id, li.order_id
@@ -90,6 +96,7 @@ orders_filt AS (
           COALESCE(l.order_id, s.order_id) AS order_id,
           COALESCE(l.items_count,0)        AS items_count,
           COALESCE(l.base_cents,0)         AS base_cents,
+          COALESCE(l.duty_cents,0)                  AS duty_cents,
           COALESCE(l.margin_cents,0)       AS margin_cents,
           COALESCE(l.tax_cents,0)          AS tax_cents,
           COALESCE(s.shipping_owner_cents,0) AS shipping_owner_cents,
@@ -105,6 +112,7 @@ orders_filt AS (
           COUNT(DISTINCT p.order_id)                 AS orders_count,
           SUM(p.items_count)                         AS items_count,
           SUM(p.base_cents)                          AS base_cents,
+          SUM(p.duty_cents)                          AS duty_cents,
           SUM(p.margin_cents)                        AS margin_cents,
           SUM(p.tax_cents)                           AS tax_cents,
           SUM(p.shipping_owner_cents)                AS shipping_owner_cents,
@@ -119,15 +127,17 @@ orders_filt AS (
         a.orders_count,
         a.items_count,
         a.base_cents,
+        a.duty_cents,
         a.margin_cents,
         a.tax_cents,
         a.shipping_owner_cents,
         a.gateway_fee_cents,
         /* derivados coherentes con tu modelo de pagos */
-        a.base_cents                                       AS owner_product_cents_without_tax,
-        a.base_cents                                       AS owner_product_cents_with_tax, -- (si el owner NO recibe impuestos)
-        (a.base_cents + a.shipping_owner_cents)            AS owner_total_cents_without_tax,
-        (a.base_cents + a.shipping_owner_cents)            AS owner_total_cents_with_tax,
+        /* derivados: al owner se le paga base + aranceles (+ envío); NO incluye impuestos */
+        (a.base_cents + a.duty_cents)                    AS owner_product_cents_without_tax,
+        (a.base_cents + a.duty_cents)                    AS owner_product_cents_with_tax, -- si el owner no recibe impuestos, queda igual
+        (a.base_cents + a.duty_cents + a.shipping_owner_cents) AS owner_total_cents_without_tax,
+        (a.base_cents + a.duty_cents + a.shipping_owner_cents) AS owner_total_cents_with_tax,
         a.margin_cents                                     AS platform_gross_margin_cents,
         (a.margin_cents)             AS platform_net_margin_cents
       FROM agg a
@@ -144,6 +154,7 @@ orders_filt AS (
       ...r,
       amounts_usd: {
         base: toUSD(r.base_cents),
+        duty: toUSD(r.duty_cents),
         margin: toUSD(r.margin_cents),
         tax: toUSD(r.tax_cents),
         shipping_owner: toUSD(r.shipping_owner_cents),
@@ -161,6 +172,7 @@ orders_filt AS (
     const totals = rows.reduce((acc, r) => {
       acc.items_count += Number(r.items_count || 0)
       acc.base_cents += Number(r.base_cents || 0)
+      acc.duty_cents += Number(r.duty_cents || 0)
       acc.margin_cents += Number(r.margin_cents || 0)
       acc.tax_cents += Number(r.tax_cents || 0)
       acc.shipping_owner_cents += Number(r.shipping_owner_cents || 0)
@@ -176,6 +188,7 @@ orders_filt AS (
       orders_count: 0, // lo llenamos con un COUNT distinct real
       items_count: 0,
       base_cents: 0,
+      duty_cents: 0,
       margin_cents: 0,
       tax_cents: 0,
       shipping_owner_cents: 0,
@@ -288,12 +301,14 @@ router.post('/payouts/close', authenticateToken, requireAdmin, async (req, res) 
       li AS (
         SELECT li.order_id,
                SUM(li.quantity)::int AS items_count,
-               SUM(COALESCE((li.metadata->>'base_cents')::int,0) * li.quantity) AS base_cents,
+               SUM(COALESCE((li.metadata->>'base_cents')::int,0) * li.quantity) AS base_cents,               
+               SUM(COALESCE((li.metadata->>'duty_cents')::int,0) * li.quantity) AS duty_cents,
                SUM(
                  CASE
                    WHEN COALESCE((li.metadata->>'unit_cents_snapshot')::int,0) > 0
                      THEN ((COALESCE((li.metadata->>'unit_cents_snapshot')::int,0)
-                            - COALESCE((li.metadata->>'base_cents')::int,0)) * li.quantity)
+                          - COALESCE((li.metadata->>'base_cents')::int,0)
+                          - COALESCE((li.metadata->>'duty_cents')::int,0)) * li.quantity)
                    ELSE (ROUND(COALESCE((li.metadata->>'base_cents')::int,0)
                                * COALESCE(NULLIF(li.metadata->>'margin_pct','')::numeric,0) / 100.0)::int * li.quantity)
                  END
@@ -306,6 +321,7 @@ router.post('/payouts/close', authenticateToken, requireAdmin, async (req, res) 
         COUNT(sel.id)::int AS orders_count,
         COALESCE(SUM(li.items_count),0)::int AS items_count,
         COALESCE(SUM(li.base_cents),0)::bigint AS base_cents,
+        COALESCE(SUM(li.duty_cents),0)::bigint AS duty_cents,
         COALESCE(SUM((sel.metadata->'pricing_cents'->>'shipping_total_cents')::int),0)::bigint AS shipping_owner_cents,
         COALESCE(SUM(li.margin_cents),0)::bigint AS margin_cents,
         COALESCE(SUM((sel.metadata->'pricing_cents'->>'card_fee_cents')::int),0)::bigint AS gateway_fee_cents
@@ -315,7 +331,7 @@ router.post('/payouts/close', authenticateToken, requireAdmin, async (req, res) 
     const ids = orders.map(o => o.id)
     const { rows: a } = await client.query(aggSql, [ids])
     const agg = a[0]
-    const amount_to_owner_cents = Number(agg.base_cents) + Number(agg.shipping_owner_cents)
+    const amount_to_owner_cents = Number(agg.base_cents) + Number(agg.duty_cents) + Number(agg.shipping_owner_cents)
 
     // crea lote
     const ins = await client.query(
@@ -323,13 +339,13 @@ router.post('/payouts/close', authenticateToken, requireAdmin, async (req, res) 
         (owner_id, from_date, to_date, tz, delivered_only,
          orders_count, items_count, base_cents, shipping_owner_cents,
          amount_to_owner_cents, margin_cents, gateway_fee_cents,
-         created_by, note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+         created_by, note, duty_cents)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING id`,
       [
         ownerId, from, to, tz, !!delivered_only,
         agg.orders_count, agg.items_count, agg.base_cents, agg.shipping_owner_cents,
-        amount_to_owner_cents, agg.margin_cents, agg.gateway_fee_cents,
+        amount_to_owner_cents, agg.margin_cents, agg.gateway_fee_cents, agg.duty_cents
         (req.user && req.user.email) || null, note || null
       ]
     )
@@ -356,6 +372,7 @@ router.post('/payouts/close', authenticateToken, requireAdmin, async (req, res) 
         orders_count: agg.orders_count,
         items_count: agg.items_count,
         base_cents: Number(agg.base_cents),
+        duty_cents: Number(agg.duty_cents),
         shipping_owner_cents: Number(agg.shipping_owner_cents),
         amount_to_owner_cents,
         margin_cents: Number(agg.margin_cents),

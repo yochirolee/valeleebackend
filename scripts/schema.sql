@@ -187,6 +187,8 @@ CREATE TABLE IF NOT EXISTS owner_payouts (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE owner_payouts ADD COLUMN IF NOT EXISTS duty_cents bigint NOT NULL DEFAULT 0;
+
 ALTER TABLE pending_encargos
   ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'amazon',
   ADD COLUMN IF NOT EXISTS external_id TEXT NULL,
@@ -201,6 +203,25 @@ ALTER TABLE orders
 CREATE INDEX IF NOT EXISTS idx_orders_delivered_at ON orders (delivered_at DESC); 
 CREATE INDEX IF NOT EXISTS idx_orders_owner_paid ON orders (owner_paid);
 CREATE INDEX IF NOT EXISTS idx_orders_owner_payout_id ON orders (owner_payout_id);
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- === Productos: multi-idioma, arancel y keywords ===
+ALTER TABLE products
+  ADD COLUMN IF NOT EXISTS title_en TEXT,
+  ADD COLUMN IF NOT EXISTS description_en TEXT,
+  ADD COLUMN IF NOT EXISTS duty_cents INT DEFAULT 0,           -- arancel por unidad (centavos)
+  ADD COLUMN IF NOT EXISTS keywords TEXT[] DEFAULT '{}'::text[];
+
+-- Índice GIN para búsquedas por keywords
+CREATE INDEX IF NOT EXISTS idx_products_keywords_gin ON products USING GIN (keywords);
+
+-- (Opcional, pero útil) Índices para búsquedas por título/descr EN/ES
+CREATE INDEX IF NOT EXISTS idx_products_title_en_trgm ON products USING GIN (title_en gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_products_description_en_trgm ON products USING GIN (description_en gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_products_title_trgm ON products USING GIN (title gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_products_description_trgm ON products USING GIN (description gin_trgm_ops);
+
 -- ==========================================================
 -- Asegurar compatibilidad con BD que ya existía (columnas/FKs)
 -- ==========================================================

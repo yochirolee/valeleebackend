@@ -259,19 +259,27 @@ router.get('/orders/:id/detail', authenticateToken, async (req, res) => {
 
     // ⬇️ Cambio: COALESCE a metadata para cubrir items de Encargos (sin product_id)
     const { rows: items } = await pool.query(
-      `SELECT
-         li.product_id,
-         COALESCE(p.title,       li.metadata->>'title')      AS product_name,
-         COALESCE(p.image_url,   li.metadata->>'image_url')  AS image_url,
-         li.metadata->>'source_url'                          AS source_url,
-         li.quantity,
-         li.unit_price
-       FROM line_items li
-       LEFT JOIN products p ON p.id = li.product_id
+      `
+      SELECT
+        li.product_id,
+        COALESCE(p.title,       li.metadata->>'title')      AS product_name,
+        COALESCE(
+          li.metadata->>'title_en',
+          p.title_en,
+          NULLIF(p.metadata->>'title_en','')
+        )                                                   AS product_name_en,
+        COALESCE(p.image_url,   li.metadata->>'image_url')  AS image_url,
+        li.metadata->>'source_url'                          AS source_url,
+        li.quantity,
+        li.unit_price
+      FROM line_items li
+      LEFT JOIN products p ON p.id = li.product_id
       WHERE li.order_id = $1
-      ORDER BY li.id ASC`,
+      ORDER BY li.id ASC
+      `,
       [id]
-    );
+    )
+      ;
 
     return res.json({
       order: {
@@ -291,6 +299,7 @@ router.get('/orders/:id/detail', authenticateToken, async (req, res) => {
       items: items.map(it => ({
         product_id: it.product_id,
         product_name: it.product_name || undefined,
+        product_name_en: it.product_name_en || undefined,
         image_url: it.image_url || null,
         source_url: it.source_url || null, // opcional para UI
         quantity: Number(it.quantity),
@@ -567,19 +576,25 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
     const o = headRows[0];
 
     const { rows: itemRows } = await pool.query(`
-            SELECT
-              li.product_id,
-              COALESCE(p.title,      li.metadata->>'title')     AS product_name,
-              COALESCE(p.image_url,  li.metadata->>'image_url') AS image_url,
-              li.metadata->>'source_url'                        AS source_url,
-              li.metadata->>'external_id'                       AS external_id,
-              li.quantity,
-              li.unit_price
-            FROM line_items li
-            LEFT JOIN products p ON p.id = li.product_id
-            WHERE li.order_id = $1
-            ORDER BY li.id ASC
-          `, [id]);
+      SELECT
+        li.product_id,
+        COALESCE(p.title,      li.metadata->>'title')      AS product_name,
+        COALESCE(
+          li.metadata->>'title_en',
+          p.title_en,
+          NULLIF(p.metadata->>'title_en','')
+        )                                                 AS product_name_en,
+        COALESCE(p.image_url,  li.metadata->>'image_url') AS image_url,
+        li.metadata->>'source_url'                        AS source_url,
+        li.metadata->>'external_id'                       AS external_id,
+        li.quantity,
+        li.unit_price
+      FROM line_items li
+      LEFT JOIN products p ON p.id = li.product_id
+      WHERE li.order_id = $1
+      ORDER BY li.id ASC
+    `, [id]);
+
 
     const subtotalCalc = itemRows.reduce((acc, it) => acc + Number(it.quantity) * Number(it.unit_price), 0)
     const snapSubtotal = Number(o.metadata?.pricing?.subtotal ?? o.metadata?.payment?.subtotal)
@@ -649,6 +664,7 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
       items: itemRows.map(it => ({
         product_id: it.product_id,                        // puede ser null en encargos
         product_name: it.product_name || 'Encargo',
+        product_name_en: it.product_name_en || undefined,
         image_url: it.image_url || null,
         source_url: it.source_url || null,
         external_id: it.external_id || null,
@@ -1159,23 +1175,29 @@ router.get('/customers/:customerId/orders', authenticateToken, async (req, res) 
         o.status,
         o.payment_method,
         o.metadata,
-
+    
         li.product_id,
         li.quantity,
         li.unit_price,
-
-        -- para encargos (sin product_id), leemos del metadata del line_item
+    
+        -- nombres e imagen (incluye encargos sin product_id)
         COALESCE(p.title,     li.metadata->>'title')      AS product_name,
+        COALESCE(
+          li.metadata->>'title_en',
+          p.title_en,
+          NULLIF(p.metadata->>'title_en','')
+        )                                                 AS product_name_en,
         COALESCE(p.image_url, li.metadata->>'image_url')  AS image_url,
-        li.metadata->>'source_url'                         AS source_url
+        li.metadata->>'source_url'                        AS source_url
       FROM orders o
-      JOIN line_items li         ON o.id = li.order_id
-      LEFT JOIN products  p      ON p.id = li.product_id    -- ⬅️ LEFT JOIN para incluir encargos
+      JOIN line_items li    ON o.id = li.order_id
+      LEFT JOIN products  p ON p.id = li.product_id
       WHERE o.customer_id = $1
       ORDER BY o.created_at DESC, li.id ASC
       `,
       [customerId]
-    );
+    )
+
 
     const rows = ordersResult.rows;
     const grouped = {};
@@ -1193,6 +1215,7 @@ router.get('/customers/:customerId/orders', authenticateToken, async (req, res) 
       grouped[row.order_id].items.push({
         product_id: row.product_id,                   // puede ser null en encargos
         product_name: row.product_name || undefined,  // viene de COALESCE(...)
+        product_name_en: row.product_name_en || undefined,
         quantity: Number(row.quantity),
         unit_price: Number(row.unit_price),
         image_url: row.image_url || null,
