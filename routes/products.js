@@ -671,26 +671,248 @@ router.get('/products/search', async (req, res) => {
     }
   });
 
-/* ===================
-   GET by id
-   =================== */
-router.get('/products/:id', async (req, res) => {
+  // ===================
+// OWNER DETAILS (PUBLIC)
+// ===================
+router.get('/owners/:id', async (req, res) => {
+  const ownerId = Number(req.params.id);
+  if (!Number.isInteger(ownerId) || ownerId <= 0) return res.status(400).json({ error: 'owner id inválido' });
+
   try {
-    const result = await pool.query(
-      `SELECT id, title, description, title_en, description_en,
-              price, weight, category_id, image_url, metadata, stock_qty, owner_id,
-              duty_cents, keywords
-         FROM products
-        WHERE id = $1`,
-      [req.params.id]
-    )
-    if (!result.rows.length) return res.status(404).send('Producto no encontrado')
-    res.json(result.rows[0])
-  } catch (error) {
-    console.error(error)
-    res.status(500).send('Error al obtener producto')
+    const { rows } = await pool.query(
+      `SELECT id, name, email, phone, active, metadata, created_at
+         FROM owners WHERE id = $1`,
+      [ownerId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Owner no encontrado' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('GET /owners/:id error', e);
+    res.status(500).json({ error: 'Error al obtener owner' });
   }
-})
+});
+
+// ===================
+// PRODUCTS BY OWNER (PUBLIC, paginado)
+// GET /products/owner/:owner_id?page=1&limit=24&country=CU&province=...&area_type=...&municipality=...
+// ===================
+router.get('/products/owner/:owner_id', async (req, res) => {
+  const ownerId = Number(req.params.owner_id);
+  if (!Number.isInteger(ownerId) || ownerId <= 0) return res.status(400).json({ error: 'owner id inválido' });
+
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(48, Math.max(1, Number(req.query.limit) || 24));
+  const off = (page - 1) * limit;
+
+  const { country, province, area_type, municipality } = req.query;
+
+  try {
+    const countryNorm = String(country || '').toUpperCase();
+    const prov = String(province || '').trim();
+    const mun = String(municipality || req.query.municipio || '').trim();
+
+    let params = [ownerId];
+    let locationSql = 'TRUE';
+
+    // Igual criterio de disponibilidad que en /products, pero forzando owner_id
+    if (countryNorm === 'US') {
+      locationSql = `
+        EXISTS (
+          SELECT 1 FROM owner_shipping_config osc
+           WHERE osc.owner_id = p.owner_id
+             AND osc.active = true
+             AND osc.country = 'US'
+        )
+      `;
+    } else if (countryNorm === 'CU') {
+      const zone = zoneKeyForCuba(prov, area_type);
+      let zoneFixedCol, zoneBaseCol;
+      if (zone === 'habana_city') { zoneFixedCol = 'cu_hab_city_flat'; zoneBaseCol = 'cu_hab_city_base'; }
+      else if (zone === 'habana_municipio') { zoneFixedCol = 'cu_hab_rural_flat'; zoneBaseCol = 'cu_hab_rural_base'; }
+      else if (zone === 'provincias_city') { zoneFixedCol = 'cu_other_city_flat'; zoneBaseCol = 'cu_other_city_base'; }
+      else if (zone === 'provincias_municipio') { zoneFixedCol = 'cu_other_rural_flat'; zoneBaseCol = 'cu_other_rural_base'; }
+
+      const zoneClause = (zoneFixedCol && zoneBaseCol) ? `
+        (
+          (osc.mode = 'fixed'  AND osc.${zoneFixedCol} IS NOT NULL)
+          OR
+          (osc.mode <> 'fixed' AND (osc.cu_rate_per_lb IS NOT NULL OR osc.${zoneBaseCol} IS NOT NULL OR osc.cu_min_fee IS NOT NULL))
+        )
+      ` : `TRUE`;
+
+      params.push(prov); const iProv = params.length;
+      params.push(mun);  const iMun  = params.length;
+
+      locationSql = `
+        EXISTS (
+          SELECT 1 FROM owner_shipping_config osc
+           WHERE osc.owner_id = p.owner_id
+             AND osc.active = true
+             AND osc.country = 'CU'
+             AND ${zoneClause}
+             AND (
+               COALESCE(osc.cu_restrict_to_list, false) = false
+               OR EXISTS (
+                    SELECT 1 FROM owner_cu_areas oa
+                     WHERE oa.owner_id = p.owner_id
+                       AND lower(oa.province) = lower($${iProv})
+                       AND (oa.municipality IS NULL OR lower(oa.municipality) = lower($${iMun}))
+               )
+             )
+        )
+      `;
+    }
+
+    const archivedClause = `
+      COALESCE(
+        CASE
+          WHEN jsonb_typeof(p.metadata->'archived')='boolean' THEN (p.metadata->>'archived')::boolean
+          WHEN jsonb_typeof(p.metadata->'archived')='string'  THEN lower(p.metadata->>'archived') IN ('true','t','yes','1')
+          ELSE false
+        END
+      , false) = false
+    `;
+
+    const sql = `
+      WITH src AS (
+        SELECT
+          p.id, p.title, p.description, p.title_en, p.description_en,
+          p.price, p.weight, p.category_id, p.image_url, p.metadata, p.stock_qty,
+          p.owner_id, p.duty_cents, p.keywords,
+          o.name AS owner_name
+        FROM products p
+        LEFT JOIN owners o ON o.id = p.owner_id
+        WHERE p.owner_id = $1
+          AND ${archivedClause}
+          AND ${locationSql}
+        ORDER BY p.id DESC
+        LIMIT ${limit + 1} OFFSET ${off}
+      ),
+      calc AS (
+        SELECT
+          *,
+          COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) AS base_cents,
+          COALESCE(duty_cents, 0)                                          AS duty_cents_safe,
+          COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)         AS margin_pct,
+          CASE
+            WHEN jsonb_typeof(metadata->'taxable')='boolean' THEN (metadata->>'taxable')::boolean
+            WHEN jsonb_typeof(metadata->'taxable')='string'  THEN lower(metadata->>'taxable') IN ('true','t','yes','1')
+            ELSE true
+          END AS taxable,
+          COALESCE(NULLIF(metadata->>'tax_pct','')::numeric, 0)            AS tax_pct,
+          (COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) + COALESCE(duty_cents,0)) AS effective_cents
+        FROM src p
+      )
+      SELECT
+        id, title, description, title_en, description_en,
+        price, weight, category_id, image_url, metadata, stock_qty,
+        owner_id, owner_name, duty_cents, keywords,
+        ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
+        CASE WHEN taxable
+             THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
+             ELSE 0 END AS tax_cents,
+        (ROUND(effective_cents * (100 + margin_pct) / 100.0)::int
+          + CASE WHEN taxable
+                 THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
+                 ELSE 0 END) AS display_total_cents,
+        ROUND(
+          (
+            ROUND(effective_cents * (100 + margin_pct) / 100.0)::numeric
+            + CASE WHEN taxable
+                   THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::numeric
+                   ELSE 0 END
+          ) / 100.0
+        , 2) AS display_total_usd
+      FROM calc;
+    `;
+
+    const { rows } = await pool.query(sql, params);
+    const has_more = rows.length > limit;
+    const items = has_more ? rows.slice(0, limit) : rows;
+
+    // nombre para encabezado
+    const ownerName = items[0]?.owner_name || null;
+    return res.json({ owner: { id: ownerId, name: ownerName }, items, page, limit, has_more });
+  } catch (e) {
+    console.error('GET /products/owner/:owner_id error', e);
+    return res.status(500).json({ error: 'Error al obtener productos del owner' });
+  }
+});
+
+
+/* ===================
+   GET by id (con precios calculados)
+   =================== */
+   router.get('/products/:id', async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).send('Id inválido');
+  
+    try {
+      const sql = `
+        WITH src AS (
+          SELECT
+            p.id, p.title, p.description, p.title_en, p.description_en,
+            p.price, p.weight, p.category_id, p.image_url, p.metadata, p.stock_qty,
+            p.owner_id, p.duty_cents, p.keywords
+          FROM products p
+          WHERE p.id = $1
+          LIMIT 1
+        ),
+        calc AS (
+          SELECT
+            *,
+            COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) AS base_cents,
+            COALESCE(duty_cents, 0)                                          AS duty_cents_safe,
+            COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)         AS margin_pct,
+            CASE
+              WHEN jsonb_typeof(metadata->'taxable')='boolean' THEN (metadata->>'taxable')::boolean
+              WHEN jsonb_typeof(metadata->'taxable')='string'  THEN lower(metadata->>'taxable') IN ('true','t','yes','1')
+              ELSE true
+            END AS taxable,
+            COALESCE(NULLIF(metadata->>'tax_pct','')::numeric, 0)            AS tax_pct,
+            (COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) + COALESCE(duty_cents,0)) AS effective_cents
+          FROM src
+        )
+        SELECT
+          id, title, description, title_en, description_en,
+          price, weight, category_id, image_url, metadata, stock_qty,
+          owner_id, duty_cents, keywords,
+  
+          -- precio base + arancel + margen
+          ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
+          ROUND(ROUND(effective_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd,
+  
+          -- impuesto (si aplica)
+          CASE WHEN taxable
+               THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
+               ELSE 0 END AS tax_cents,
+  
+          -- total final para UI
+          (ROUND(effective_cents * (100 + margin_pct) / 100.0)::int
+            + CASE WHEN taxable
+                   THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
+                   ELSE 0 END) AS display_total_cents,
+  
+          ROUND(
+            (
+              ROUND(effective_cents * (100 + margin_pct) / 100.0)::numeric
+              + CASE WHEN taxable
+                     THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::numeric
+                     ELSE 0 END
+            ) / 100.0
+          , 2) AS display_total_usd
+        FROM calc;
+      `;
+  
+      const { rows } = await pool.query(sql, [id]);
+      if (!rows.length) return res.status(404).send('Producto no encontrado');
+      res.json(rows[0]);
+    } catch (error) {
+      console.error(error);
+      res.status(500).send('Error al obtener producto');
+    }
+  });
+  
 
 /* ===================
    CREATE (admin)
