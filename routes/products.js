@@ -457,6 +457,220 @@ router.get('/products/search', async (req, res) => {
   }
 });
 
+/* ============================
+   PRODUCTS BY OWNERS (PUBLIC)
+   ============================ */
+   router.get('/products/by-owners', async (req, res) => {
+    const {
+      country,
+      province,
+      area_type,
+      municipality,
+      owners_limit = '8',
+      per_owner = '4',
+      owner_ids, // "1,2,3"
+    } = req.query;
+  
+    // Límites seguros
+    const ownersLim = Math.min(24, Math.max(1, Number(owners_limit) || 8));
+    const perOwnerLim = Math.min(12, Math.max(1, Number(per_owner) || 4));
+  
+    // Parse de owner_ids si viene
+    const ownerIdList = String(owner_ids || '')
+      .split(',')
+      .map(s => Number(s.trim()))
+      .filter(n => Number.isInteger(n) && n > 0);
+  
+    try {
+      const countryNorm = String(country || '').toUpperCase();
+      const prov = String(province || '').trim();
+      const mun = String(municipality || req.query.municipio || '').trim();
+  
+      let params = [];
+      let locationSql = 'TRUE';
+  
+      // Disponibilidad por país + zona (idéntico criterio a /products, pero
+      // aquí *exigimos* owner_id porque agrupamos por dueño).
+      if (countryNorm === 'US') {
+        locationSql = `
+          EXISTS (
+            SELECT 1 FROM owner_shipping_config osc
+             WHERE osc.owner_id = p.owner_id
+               AND osc.active = true
+               AND osc.country = 'US'
+          )
+        `;
+      } else if (countryNorm === 'CU') {
+        const zone = zoneKeyForCuba(prov, area_type);
+        let zoneFixedCol, zoneBaseCol;
+        if (zone === 'habana_city') { zoneFixedCol = 'cu_hab_city_flat'; zoneBaseCol = 'cu_hab_city_base'; }
+        else if (zone === 'habana_municipio') { zoneFixedCol = 'cu_hab_rural_flat'; zoneBaseCol = 'cu_hab_rural_base'; }
+        else if (zone === 'provincias_city') { zoneFixedCol = 'cu_other_city_flat'; zoneBaseCol = 'cu_other_city_base'; }
+        else if (zone === 'provincias_municipio') { zoneFixedCol = 'cu_other_rural_flat'; zoneBaseCol = 'cu_other_rural_base'; }
+  
+        const zoneClause = (zoneFixedCol && zoneBaseCol) ? `
+          (
+            (osc.mode = 'fixed'  AND osc.${zoneFixedCol} IS NOT NULL)
+            OR
+            (osc.mode <> 'fixed' AND (osc.cu_rate_per_lb IS NOT NULL OR osc.${zoneBaseCol} IS NOT NULL OR osc.cu_min_fee IS NOT NULL))
+          )
+        ` : `TRUE`;
+  
+        params.push(prov); const iProv = params.length;
+        params.push(mun);  const iMun  = params.length;
+  
+        locationSql = `
+          EXISTS (
+            SELECT 1 FROM owner_shipping_config osc
+             WHERE osc.owner_id = p.owner_id
+               AND osc.active = true
+               AND osc.country = 'CU'
+               AND ${zoneClause}
+               AND (
+                 COALESCE(osc.cu_restrict_to_list, false) = false
+                 OR EXISTS (
+                     SELECT 1 FROM owner_cu_areas oa
+                      WHERE oa.owner_id = p.owner_id
+                        AND lower(oa.province) = lower($${iProv})
+                        AND (oa.municipality IS NULL OR lower(oa.municipality) = lower($${iMun}))
+                 )
+               )
+          )
+        `;
+      }
+  
+      // Filtro de archivados (idéntico a /products)
+      const archivedClause = `
+        COALESCE(
+          CASE
+            WHEN jsonb_typeof(p.metadata->'archived')='boolean' THEN (p.metadata->>'archived')::boolean
+            WHEN jsonb_typeof(p.metadata->'archived')='string'  THEN lower(p.metadata->>'archived') IN ('true','t','yes','1')
+            ELSE false
+          END
+        , false) = false
+      `;
+  
+      // Si filtran por owner_ids
+      let ownersFilterSql = 'TRUE';
+      if (ownerIdList.length) {
+        params.push(ownerIdList); // $idx ::int[]
+        ownersFilterSql = `p.owner_id = ANY($${params.length}::int[])`;
+      }
+  
+      // SQL:
+      // 1) src: productos válidos por owner
+      // 2) calc: mismos cálculos de precio que /products
+      // 3) owners_pick: los top owners por cantidad de productos (o por nombre si empata)
+      // 4) ranked: top N productos por owner
+      const sql = `
+        WITH src AS (
+          SELECT
+            p.id, p.title, p.description, p.title_en, p.description_en,
+            p.price, p.weight, p.category_id, p.image_url,
+            p.metadata, p.stock_qty, p.owner_id,
+            p.duty_cents, p.keywords,
+            o.name AS owner_name
+          FROM products p
+          LEFT JOIN owners o ON o.id = p.owner_id
+          WHERE ${archivedClause}
+            AND p.owner_id IS NOT NULL
+            AND ${ownersFilterSql}
+            AND ${locationSql}
+        ),
+        calc AS (
+          SELECT
+            *,
+            COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) AS base_cents,
+            COALESCE(duty_cents, 0)                                          AS duty_cents_safe,
+            COALESCE(NULLIF(metadata->>'margin_pct','')::numeric, 0)         AS margin_pct,
+            CASE
+              WHEN jsonb_typeof(metadata->'taxable')='boolean' THEN (metadata->>'taxable')::boolean
+              WHEN jsonb_typeof(metadata->'taxable')='string'  THEN lower(metadata->>'taxable') IN ('true','t','yes','1')
+              ELSE true
+            END AS taxable,
+            COALESCE(NULLIF(metadata->>'tax_pct','')::numeric, 0)            AS tax_pct,
+            (COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) + COALESCE(duty_cents,0)) AS effective_cents
+          FROM src
+        ),
+        owners_pick AS (
+          SELECT owner_id, COALESCE(owner_name,'Sin dueño') AS owner_name, COUNT(*) AS n
+          FROM calc
+          GROUP BY owner_id, owner_name
+          ORDER BY n DESC, owner_name ASC
+          LIMIT ${ownersLim}
+        ),
+        ranked AS (
+          SELECT
+            c.*,
+            ROW_NUMBER() OVER (PARTITION BY c.owner_id ORDER BY c.id DESC) AS rn
+          FROM calc c
+          JOIN owners_pick op ON op.owner_id = c.owner_id
+        )
+        SELECT
+          id, title, description, title_en, description_en,
+          price, weight, category_id, image_url,
+          metadata, stock_qty, owner_id, owner_name,
+          duty_cents, keywords,
+          -- valores finales para UI (idénticos a /products)
+          ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
+          CASE WHEN taxable
+               THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
+               ELSE 0 END                                          AS tax_cents,
+          (ROUND(effective_cents * (100 + margin_pct) / 100.0)::int
+            + CASE WHEN taxable
+                   THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
+                   ELSE 0 END)                                     AS display_total_cents,
+          ROUND(
+            (
+              ROUND(effective_cents * (100 + margin_pct) / 100.0)::numeric
+              + CASE WHEN taxable
+                     THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::numeric
+                     ELSE 0 END
+            ) / 100.0
+          , 2)                                                     AS display_total_usd
+        FROM ranked
+        WHERE rn <= ${perOwnerLim}
+        ORDER BY owner_name ASC, id DESC;
+      `;
+  
+      const { rows } = await pool.query(sql, params);
+  
+      // Agrupar en JSON por owner
+      const map = new Map();
+      for (const r of rows) {
+        const key = Number(r.owner_id);
+        if (!map.has(key)) {
+          map.set(key, {
+            owner_id: key,
+            owner_name: r.owner_name || 'Sin dueño',
+            products: [],
+          });
+        }
+        map.get(key).products.push({
+          id: r.id,
+          title: r.title,
+          description: r.description,
+          title_en: r.title_en,
+          description_en: r.description_en,
+          image_url: r.image_url,
+          metadata: r.metadata,
+          stock_qty: r.stock_qty,
+          duty_cents: r.duty_cents,
+          keywords: r.keywords,
+          price_with_margin_cents: r.price_with_margin_cents,
+          tax_cents: r.tax_cents,
+          display_total_cents: r.display_total_cents,
+          display_total_usd: r.display_total_usd,
+        });
+      }
+  
+      res.json({ owners: Array.from(map.values()) });
+    } catch (e) {
+      console.error('GET /products/by-owners error', e);
+      res.status(500).json({ error: 'Error al obtener productos por owner' });
+    }
+  });
+
 /* ===================
    GET by id
    =================== */
