@@ -18,6 +18,7 @@ let pool
 
 // 👉 En desarrollo, reutiliza un único Pool aunque el código se recargue.
 if (process.env.NODE_ENV !== 'production') {
+  
   if (!global.__PG_POOL__) {
     global.__PG_POOL__ = new Pool(config)
     global.__PG_POOL__.on('error', (err) => console.error('[pg] idle client error', err))
