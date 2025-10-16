@@ -11,8 +11,8 @@ const resendKey = process.env.RESEND_API_KEY;
 const resend = new Resend(resendKey);
 
 // Remitentes verificados
-const FROM_CUSTOMER = process.env.FROM_EMAIL_CUSTOMER || process.env.FROM_EMAIL || 'info@valelee.com';
-const FROM_OWNER = process.env.FROM_EMAIL_OWNER || process.env.FROM_EMAIL || 'info@valelee.com';
+const FROM_CUSTOMER = process.env.FROM_EMAIL_CUSTOMER || process.env.FROM_EMAIL || 'soporte@api.ctenvios.com';
+const FROM_OWNER = process.env.FROM_EMAIL_OWNER || process.env.FROM_EMAIL || 'soporte@api.ctenvios.com';
 
 // Opcionales: personalización visual y enlaces
 const LOGO_URL = process.env.EMAIL_LOGO_URL || ''; // ej: https://tu-dominio.com/logo.png
@@ -25,7 +25,6 @@ const nonce = () => Math.random().toString(36).slice(2, 10);
 
 // ===== Helpers =====
 // Admins que deben recibir siempre el correo de owner.
-// Puede ser "ops@valelee.com,admin@valelee.com"
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || '')
   .split(/[,\s;]+/)
   .map(s => s.trim())
@@ -201,14 +200,14 @@ function wrapEmail({ previewText, heading, blocksHtml }) {
         <table role="presentation" cellpadding="0" cellspacing="0" width="600" style="width:600px;max-width:100%;border:1px solid #E5E5E5;">
           <tr>
             <td style="padding:24px 24px 12px 24px;text-align:center;">
-              ${LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="Valelee" style="max-width:140px;height:auto;display:block;margin:0 auto 8px auto;" />` : ''}
+              ${LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="CTEnviosOnline" style="max-width:140px;height:auto;display:block;margin:0 auto 8px auto;" />` : ''}
               <h1 style="font-size:24px;line-height:1.3;margin:0;font-weight:700;letter-spacing:-0.4px;">${esc(heading)}</h1>
             </td>
           </tr>
           ${blocksHtml}
           <tr>
             <td style="padding:18px 24px 28px 24px;color:#AFAFAF;font-size:12px;text-align:center;">
-              © ${new Date().getFullYear()} Valelee. Este es un correo automático; no respondas a esta dirección.
+              © ${new Date().getFullYear()} CTEnvios Online. Este es un correo automático; no respondas a esta dirección.
             </td>
           </tr>
         </table>
@@ -458,11 +457,11 @@ async function sendCustomerOrderEmail(to, order, items) {
     'X-Order-Id': String(order.id),
     'X-Email-Role': 'customer',
     'X-Entity-Ref-ID': `cust-${order.id}-${nonce()}`,
-    'List-Id': `customer-${order.id}.orders.valelee.com`,
+    'List-Id': `customer-${order.id}.orders.shop.ctenvios.com`,
   };
 
   return await resend.emails.send({
-    from: `Valelee Pedidos <${FROM_CUSTOMER}>`,
+    from: `CTEnvios Online Pedidos <${FROM_CUSTOMER}>`,
     to,
     subject,
     html,
@@ -479,7 +478,7 @@ async function sendOwnerOrderEmail(to, order, items) {
     'X-Order-Id': String(order.id),
     'X-Email-Role': 'owner',
     'X-Entity-Ref-ID': `owner-${order.id}-${nonce()}`,
-    'List-Id': `owner-${order.id}.orders.valelee.com`,
+    'List-Id': `owner-${order.id}.orders.shop.ctenvios.com`,
   };
 
   // destinatarios del proveedor
@@ -488,7 +487,7 @@ async function sendOwnerOrderEmail(to, order, items) {
   // si no hay owner, el/los admin reciben el correo en TO (fallback)
   const finalTo = ownerRecipients.length
     ? ownerRecipients
-    : (ADMIN_EMAILS.length ? ADMIN_EMAILS : ['info@valelee.com']);
+    : (ADMIN_EMAILS.length ? ADMIN_EMAILS : ['soporte@api.ctenvios.com']);
 
   // si hay owner, admins van en BCC; evita duplicados
   const bcc = ownerRecipients.length
@@ -498,7 +497,7 @@ async function sendOwnerOrderEmail(to, order, items) {
     : [];
 
   return await resend.emails.send({
-    from: `Valelee Proveedores <${FROM_OWNER}>`,
+    from: `CTEnvios Online Proveedores <${FROM_OWNER}>`,
     to: finalTo,             // array o string
     ...(bcc.length ? { bcc } : {}),
     subject,
