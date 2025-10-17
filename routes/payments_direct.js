@@ -8,6 +8,8 @@ const { sendCustomerOrderEmail, sendOwnerOrderEmail } = require('../helpers/emai
 const { getThreeDSCreds } = require('../services/bmspay3ds');
 
 const API_BASE_URL = process.env.API_BASE_URL;
+const THREE_DS_ENABLED =
+  (process.env.BMS_3DS_ENABLED ?? 'true').toLowerCase() !== 'false';
 
 // === Anti-fraude mínimo (helpers) ===
 const crypto = require('crypto');
@@ -80,11 +82,14 @@ async function recordRiskEvent(client, ev) {
 }
 
 function decideBy3DS({ threeDSStatus, amountOk, veloOk }) {
-  // 3DS: Y/A → OK; R/N → DENY; U/C/undefined → solo si monto bajo + velocidad ok
   const s = String(threeDSStatus || '').toUpperCase();
+
+  // Si globalmente está apagado, usa solo monto+velocidad
+  if (!THREE_DS_ENABLED) return (amountOk && veloOk) ? 'allow' : 'deny';
+
   if (s === 'R' || s === 'N') return 'deny';
   if (s === 'Y' || s === 'A') return 'allow';
-  if (amountOk && veloOk) return 'allow'; // no enrolada, pero bajo riesgo
+  if (amountOk && veloOk) return 'allow';
   return 'deny';
 }
 
@@ -266,6 +271,10 @@ async function loadOrderDetail(orderId) {
 
 // === 3DS: entregar ApiKey/Token al frontend (PROTEGIDO)
 router.get('/bmspay/3ds/creds', authenticateToken, async (_req, res) => {
+  // si 3DS está apagado, no intentes pedir credenciales
+  if (!THREE_DS_ENABLED) {
+    return res.status(200).json({ ok: true, disabled: true });
+  }
   try {
     const creds = await getThreeDSCreds();
     return res.json({ ok: true, apiKey: creds.apiKey, token: creds.token });
@@ -275,7 +284,6 @@ router.get('/bmspay/3ds/creds', authenticateToken, async (_req, res) => {
     return res.status(502).json({ ok: false, message: msg });
   }
 });
-
 
 router.post('/bmspay/sale', authenticateToken, async (req, res) => {
   const customerId = req.user.id;
@@ -294,6 +302,16 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
     threeDSStatus,
     eci,
   } = req.body || {};
+
+  // Si 3DS está desactivado en el backend, ignoramos cualquier cosa que venga del front
+  const effectiveThreeDSStatus = THREE_DS_ENABLED
+    ? (String(threeDSStatus || 'U').toUpperCase())
+    : 'U';
+
+  const effectiveSecureData = THREE_DS_ENABLED ? (secureData || '') : '';
+  const effectiveSecureTransactionId = THREE_DS_ENABLED ? (secureTransactionId || '') : '';
+  const effectiveEci = THREE_DS_ENABLED ? (eci || null) : null;
+
 
   if (!sessionId || !cardNumber || !expMonth || !expYear || !cvn) {
     return res.status(400).json({ ok: false, message: 'Faltan datos de tarjeta o sessionId' });
@@ -442,10 +460,11 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
     const veloOk = await velocityOk(client, { cardHash, ip });
 
     const decision = decideBy3DS({
-      threeDSStatus,
+      threeDSStatus: effectiveThreeDSStatus,
       amountOk,
       veloOk
     });
+
 
     await recordRiskEvent(client, {
       customer_id: customerId,
@@ -454,12 +473,12 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
       bin,
       last4,
       amount,
-      three_ds: (threeDSStatus || null),
+      three_ds: (effectiveThreeDSStatus || null),
       decision,
       outcome: decision === 'deny' ? 'preauth_denied' : null,
       note: decision === 'deny'
-        ? `deny: 3DS=${String(threeDSStatus || '').toUpperCase()} amountOk=${amountOk} veloOk=${veloOk}`
-        : `preauth pass: 3DS=${String(threeDSStatus || '').toUpperCase()} amountOk=${amountOk} veloOk=${veloOk}`
+        ? `deny: 3DS=${effectiveThreeDSStatus} amountOk=${amountOk} veloOk=${veloOk}`
+        : `preauth pass: 3DS=${effectiveThreeDSStatus} amountOk=${amountOk} veloOk=${veloOk}`
     });
 
     if (decision === 'deny') {
@@ -517,10 +536,10 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
       cvn,
       nameOnCard,
       userTransactionNumber,
-      secureData: typeof secureData === 'string' ? secureData : '',
-      secureTransactionId: typeof secureTransactionId === 'string' ? secureTransactionId : '',
-
+      secureData: String(effectiveSecureData || ''),
+      secureTransactionId: String(effectiveSecureTransactionId || ''),
     });
+
     if (!saleResp.ok) {
       // registrar fallo para contadores de velocidad
       try {
@@ -531,10 +550,10 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           bin,
           last4,
           amount,
-          three_ds: (threeDSStatus || null),
+          three_ds: (effectiveThreeDSStatus || null),
           decision: 'allow',
-          outcome: 'fail',
-          note: saleResp.raw && saleResp.raw.ResponseCode ? `resp=${saleResp.raw.ResponseCode}` : saleResp.message || null
+          outcome: 'success',
+          note: saleResp.message || null
         });
       } catch { }
 
@@ -604,9 +623,9 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
                                'verbiage', $5::text,
                                'SecureTransactionId', $6::text,
                                'ThreeDS', jsonb_build_object(
-                                 'status', $7::text,
-                                 'eci', $8::text
-                               )
+                                'status', $7::text,
+                                'eci', $8::text
+                              )
                              )
           WHERE id = $1`,
       [
@@ -615,9 +634,9 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
         saleResp.reference || null,
         saleResp.userTransactionNumber || userTransactionNumber || null,
         saleResp.message || null,
-        secureTransactionId || null,
-        threeDSStatus || null,  // 👈 ADD
-        eci || null,            // 👈 ADD
+        effectiveSecureTransactionId || null,
+        effectiveThreeDSStatus || null,  // 👈
+        effectiveEci || null,            // 👈
       ]
     );
 
@@ -703,10 +722,10 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
               verbiage: saleResp.message || null,
               CardType: saleResp.raw?.CardType || null,
               LastFour: saleResp.raw?.LastFour || null,
-              threeds: {                                 // 👈 ADD
-                status: threeDSStatus || null,
-                eci: eci || null,
-                dsTransId: secureTransactionId || null
+              threeds: {
+                status: effectiveThreeDSStatus || null,
+                eci: effectiveEci || null,
+                dsTransId: effectiveSecureTransactionId || null
               }
             },
 
