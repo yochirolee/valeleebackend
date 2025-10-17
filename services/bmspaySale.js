@@ -43,6 +43,8 @@ async function sale({
   cvn,
   nameOnCard,
   userTransactionNumber,
+  secureData,              // 👈 NUEVO (SecureData del 3DS)
+  secureTransactionId,     // 👈 NUEVO (3DS Transaction ID)
 }) {
   const ExpDate = `${String(expMonth || '').padStart(2, '0')}${String(expYear || '').slice(-2)}`
   const Amount = Number(amount || 0).toFixed(2)
@@ -66,6 +68,9 @@ async function sale({
     UserTransactionNumber: userTransactionNumber || '', // 👈 lo enviamos
     Source: 'ApiClient',
     IsTest: IS_TEST ? 'true' : 'false',
+    // === 3DS (según guía Blackstone)
+    SecureData: secureData || '',                       // 👈 requerido si 3DS pasó Y/A
+    SecureTransactionId: secureTransactionId || '', 
   })
 
   const res = await fetch(ep('/api/Transactions/Sale'), {

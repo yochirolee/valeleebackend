@@ -5,8 +5,89 @@ const { pool } = require('../db');
 const authenticateToken = require('../middleware/authenticateToken');
 const { sale } = require('../services/bmspaySale');
 const { sendCustomerOrderEmail, sendOwnerOrderEmail } = require('../helpers/emailOrders');
+const { getThreeDSCreds } = require('../services/bmspay3ds');
 
 const API_BASE_URL = process.env.API_BASE_URL;
+
+// === Anti-fraude mínimo (helpers) ===
+const crypto = require('crypto');
+
+function getClientIp(req) {
+  const xf = (req.headers['x-forwarded-for'] || '').toString();
+  if (xf) return xf.split(',')[0].trim();
+  return (req.connection && req.connection.remoteAddress) || '';
+}
+
+function sha256(s) {
+  return crypto.createHash('sha256').update(String(s)).digest('hex');
+}
+
+function pickBin(cardNumber) {
+  const d = String(cardNumber || '').replace(/\D/g, '');
+  return d.slice(0, 6);
+}
+
+function pickLast4(cardNumber) {
+  const d = String(cardNumber || '').replace(/\D/g, '');
+  return d.slice(-4);
+}
+
+// reglas de velocidad muy simples
+const FAILS_PER_CARD_10M = 2;   // máx 2 fallos por tarjeta en 10 min
+const CARDS_PER_IP_30M = 3;   // máx 3 tarjetas distintas fallidas por IP en 30 min
+const AMOUNT_SOFT_LIMIT = Number(process.env.RISK_SOFT_LIMIT || 150); // USD
+
+async function velocityOk(client, { cardHash, ip }) {
+  const q1 = `SELECT COUNT(*)::int AS n
+                FROM payment_risk_events
+               WHERE ts > now() - interval '10 minutes'
+                 AND card_hash = $1
+                 AND outcome = 'fail'`;
+  const q2 = `SELECT COUNT(DISTINCT card_hash)::int AS n
+                FROM payment_risk_events
+               WHERE ts > now() - interval '30 minutes'
+                 AND ip = $1
+                 AND outcome = 'fail'`;
+  const [r1, r2] = await Promise.all([
+    client.query(q1, [cardHash]),
+    client.query(q2, [ip]),
+  ]);
+  if ((r1.rows[0]?.n || 0) >= FAILS_PER_CARD_10M) return false;
+  if ((r2.rows[0]?.n || 0) >= CARDS_PER_IP_30M) return false;
+  return true;
+}
+
+async function recordRiskEvent(client, ev) {
+  // ev: { customer_id, ip, card_hash, bin, last4, amount, three_ds, decision, outcome, note }
+  const q = `
+    INSERT INTO payment_risk_events
+      (ts, customer_id, ip, card_hash, bin, last4, amount, three_ds, decision, outcome, note)
+    VALUES (now(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+  `;
+  const args = [
+    ev.customer_id ?? null,
+    ev.ip ?? null,
+    ev.card_hash ?? null,
+    ev.bin ?? null,
+    ev.last4 ?? null,
+    Number(ev.amount ?? 0),
+    ev.three_ds ?? null,
+    ev.decision ?? null,
+    ev.outcome ?? null,
+    ev.note ?? null,
+  ];
+  try { await client.query(q, args); } catch { /* noop */ }
+}
+
+function decideBy3DS({ threeDSStatus, amountOk, veloOk }) {
+  // 3DS: Y/A → OK; R/N → DENY; U/C/undefined → solo si monto bajo + velocidad ok
+  const s = String(threeDSStatus || '').toUpperCase();
+  if (s === 'R' || s === 'N') return 'deny';
+  if (s === 'Y' || s === 'A') return 'allow';
+  if (amountOk && veloOk) return 'allow'; // no enrolada, pero bajo riesgo
+  return 'deny';
+}
+
 
 // === Helpers comunes ===
 async function fetchSession(client, sessionId, customerId) {
@@ -108,8 +189,9 @@ async function quoteShippingThroughSelf({ token, cartId, shipping }) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { Authorization: token } : {}),
+      ...(token ? { Authorization: token.startsWith('Bearer ') ? token : `Bearer ${token}` } : {}),
     },
+
     body: JSON.stringify({ cartId, shipping }),
   });
   const txt = await res.text();
@@ -182,6 +264,19 @@ async function loadOrderDetail(orderId) {
   return { order, items };
 }
 
+// === 3DS: entregar ApiKey/Token al frontend (PROTEGIDO)
+router.get('/bmspay/3ds/creds', authenticateToken, async (_req, res) => {
+  try {
+    const creds = await getThreeDSCreds();
+    return res.json({ ok: true, apiKey: creds.apiKey, token: creds.token });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'Error obteniendo 3DS creds';
+    console.error('[3DS/creds] FAIL →', msg);
+    return res.status(502).json({ ok: false, message: msg });
+  }
+});
+
+
 router.post('/bmspay/sale', authenticateToken, async (req, res) => {
   const customerId = req.user.id;
   const authHeader = req.headers.authorization || null;
@@ -194,6 +289,10 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
     cvn,
     nameOnCard,
     zipCode,
+    secureData,
+    secureTransactionId,
+    threeDSStatus,
+    eci,
   } = req.body || {};
 
   if (!sessionId || !cardNumber || !expMonth || !expYear || !cvn) {
@@ -280,13 +379,13 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
       groupsByOwner[key].items.push({
         product_id: it.product_id,
         quantity: qty,
-        unit_cents: uc,             
-        tax_cents: tc,                
+        unit_cents: uc,
+        tax_cents: tc,
         title: it.title,
         base_cents_snapshot,
         margin_pct_snapshot,
-        unit_cents_snapshot,          
-        duty_cents: duty_cents_snapshot 
+        unit_cents_snapshot,
+        duty_cents: duty_cents_snapshot
       });
 
     }
@@ -332,6 +431,47 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
     // Este 'amount' es lo que se envía al gateway (lo que realmente se cobra)
     const amount = Number((amount_cents / 100).toFixed(2));
 
+    // === [ANTI-FRAUDE] Decidir si permitimos cobrar ===
+    const ip = getClientIp(req);
+    const bin = pickBin(cardNumber);
+    const last4 = pickLast4(cardNumber);
+    // hash con sal opcional (puedes añadir process.env.RISK_SALT si quieres)
+    const cardHash = sha256(`${bin}:${last4}`);
+
+    const amountOk = amount <= AMOUNT_SOFT_LIMIT;
+    const veloOk = await velocityOk(client, { cardHash, ip });
+
+    const decision = decideBy3DS({
+      threeDSStatus,
+      amountOk,
+      veloOk
+    });
+
+    await recordRiskEvent(client, {
+      customer_id: customerId,
+      ip,
+      card_hash: cardHash,
+      bin,
+      last4,
+      amount,
+      three_ds: (threeDSStatus || null),
+      decision,
+      outcome: decision === 'deny' ? 'preauth_denied' : null,
+      note: decision === 'deny'
+        ? `deny: 3DS=${String(threeDSStatus || '').toUpperCase()} amountOk=${amountOk} veloOk=${veloOk}`
+        : `preauth pass: 3DS=${String(threeDSStatus || '').toUpperCase()} amountOk=${amountOk} veloOk=${veloOk}`
+    });
+
+    if (decision === 'deny') {
+      return res.status(402).json({
+        ok: false,
+        paid: false,
+        message: 'No pudimos procesar este pago. Prueba con otra tarjeta.',
+        reason: 'risk_denied'
+      });
+    }
+
+
     // 5) Validar stock (lock pesimista previo al cobro)
     await client.query('BEGIN');
     for (const g of Object.values(groupsByOwner)) {
@@ -355,7 +495,19 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
     await client.query('COMMIT');
 
     // 6) Cobro en BMS
-    const userTransactionNumber = `${sessionId}-${Date.now().toString(36)}`;
+    // Usa un UTN estable por sesión
+    let userTransactionNumber = s?.payment?.direct_utn || null;
+    if (!userTransactionNumber) {
+      userTransactionNumber = `${sessionId}-direct`;
+      await client.query(
+        `UPDATE checkout_sessions
+       SET payment = COALESCE(payment,'{}'::jsonb)
+                     || jsonb_build_object('direct_utn', $2::text)
+     WHERE id = $1`,
+        [sessionId, userTransactionNumber]
+      );
+    }
+
     const saleResp = await resilientSale(sale, {
       amount,
       zipCode,
@@ -365,8 +517,27 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
       cvn,
       nameOnCard,
       userTransactionNumber,
+      secureData: typeof secureData === 'string' ? secureData : '',
+      secureTransactionId: typeof secureTransactionId === 'string' ? secureTransactionId : '',
+
     });
     if (!saleResp.ok) {
+      // registrar fallo para contadores de velocidad
+      try {
+        await recordRiskEvent(client, {
+          customer_id: customerId,
+          ip,
+          card_hash: cardHash,
+          bin,
+          last4,
+          amount,
+          three_ds: (threeDSStatus || null),
+          decision: 'allow',
+          outcome: 'fail',
+          note: saleResp.raw && saleResp.raw.ResponseCode ? `resp=${saleResp.raw.ResponseCode}` : saleResp.message || null
+        });
+      } catch { }
+
       if (looksLikeGateway500(saleResp.raw)) {
         return res.status(502).json({
           ok: false,
@@ -376,17 +547,36 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           raw: null,
         });
       }
+      console.error('[bmspay] decline', { msg: saleResp.message, code: saleResp.raw?.ResponseCode });
       return res.status(402).json({
         ok: false,
         paid: false,
         message: saleResp.message || 'Pago no aprobado',
-        provider: 'bmspay',
-        raw: saleResp.raw || null,
+        provider: 'bmspay'
       });
     }
 
+
     // 7) Crear órdenes + descontar stock con idempotencia fuerte y estado processing
+    // registrar éxito para contadores de velocidad
+    try {
+      await recordRiskEvent(client, {
+        customer_id: customerId,
+        ip,
+        card_hash: cardHash,
+        bin,
+        last4,
+        amount,
+        three_ds: (threeDSStatus || null),
+        decision: 'allow',
+        outcome: 'success',
+        note: saleResp.message || null
+      });
+    } catch { }
+
+    // 7) Crear órdenes + descontar stock...
     await client.query('BEGIN');
+
 
     // Bloquear sesión e idempotencia
     const { rows: sessLockRows } = await client.query(
@@ -411,7 +601,12 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
                                'AuthorizationNumber', $2::text,
                                'ServiceReferenceNumber', $3::text,
                                'UserTransactionNumber', $4::text,
-                               'verbiage', $5::text
+                               'verbiage', $5::text,
+                               'SecureTransactionId', $6::text,
+                               'ThreeDS', jsonb_build_object(
+                                 'status', $7::text,
+                                 'eci', $8::text
+                               )
                              )
           WHERE id = $1`,
       [
@@ -419,9 +614,13 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
         saleResp.authNumber || null,
         saleResp.reference || null,
         saleResp.userTransactionNumber || userTransactionNumber || null,
-        saleResp.message || null
+        saleResp.message || null,
+        secureTransactionId || null,
+        threeDSStatus || null,  // 👈 ADD
+        eci || null,            // 👈 ADD
       ]
     );
+
 
     // Shipping por owner
     const shippingByOwner = {};
@@ -504,7 +703,13 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
               verbiage: saleResp.message || null,
               CardType: saleResp.raw?.CardType || null,
               LastFour: saleResp.raw?.LastFour || null,
+              threeds: {                                 // 👈 ADD
+                status: threeDSStatus || null,
+                eci: eci || null,
+                dsTransId: secureTransactionId || null
+              }
             },
+
           })
         ]
       );
@@ -535,14 +740,18 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
           ]
         );
 
-        await client.query(
+        const upd = await client.query(
           `UPDATE products
               SET stock_qty = stock_qty - $1,
                   metadata = (COALESCE(metadata,'{}'::jsonb) - 'archived')
                            || jsonb_build_object('archived', CASE WHEN (stock_qty - $1) <= 0 THEN true ELSE false END)
-            WHERE id = $2`,
+            WHERE id = $2 AND stock_qty >= $1`,                     // 👈 ADD condición
           [Number(it.quantity), it.product_id]
         );
+        if (upd.rowCount !== 1) {
+          throw new Error(`Race stock for product ${it.product_id}`); // hará ROLLBACK
+        }
+
       }
 
     }

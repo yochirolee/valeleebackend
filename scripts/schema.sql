@@ -167,6 +167,25 @@ CREATE TABLE IF NOT EXISTS pending_encargos (
   created_at TIMESTAMP DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS payment_risk_events (
+  id           bigserial PRIMARY KEY,
+  ts           timestamptz NOT NULL DEFAULT now(),
+  customer_id  integer,
+  ip           text,
+  card_hash    text,
+  bin          text,
+  last4        text,
+  amount       numeric(12,2),
+  three_ds     text,       -- 'Y','A','N','R','U','C'...
+  decision     text,       -- 'allow' | 'deny' | 'review'
+  outcome      text,       -- 'success' | 'fail' | 'preauth_denied'
+  note         text
+);
+CREATE INDEX IF NOT EXISTS idx_risk_ts ON payment_risk_events(ts);
+CREATE INDEX IF NOT EXISTS idx_risk_card ON payment_risk_events(card_hash);
+CREATE INDEX IF NOT EXISTS idx_risk_ip   ON payment_risk_events(ip);
+
+
 -- tabla de lotes de pago a owners
 CREATE TABLE IF NOT EXISTS owner_payouts (
   id SERIAL PRIMARY KEY,
