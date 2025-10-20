@@ -45,6 +45,13 @@ const app = express()
 app.set('trust proxy', 1)
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+app.get('/debug/db', (_req, res) => {
+  res.json({
+    total: pool.totalCount,     // conexiones creadas
+    idle: pool.idleCount,       // libres
+    waiting: pool.waitingCount, // peticiones esperando
+  })
+})
 
 // CORS
 const originsFromEnv = (process.env.CLIENT_ORIGIN || '')
