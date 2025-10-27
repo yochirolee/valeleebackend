@@ -252,22 +252,52 @@ async function loadOrderDetail(orderId) {
   const order = hr[0];
 
   const itemsQ = `
-    SELECT li.product_id,
-           li.quantity,
-           li.unit_price,
-           p.title AS product_name,
-           p.image_url,
-           p.owner_id,
-           ow.name AS owner_name,
-           ow.email AS owner_email
-      FROM line_items li
-      LEFT JOIN products p ON p.id = li.product_id
-      LEFT JOIN owners ow ON ow.id = p.owner_id
-     WHERE li.order_id = $1
-     ORDER BY li.id ASC
-  `;
-  const { rows: items } = await pool.query(itemsQ, [orderId]);
-  return { order, items };
+  SELECT
+    li.product_id,
+    li.variant_id,
+    li.quantity,
+    li.unit_price,
+
+    /* Nombre del producto con fallback a metadata del line_item */
+    COALESCE(
+      p.title,
+      li.metadata->>'title'
+    ) AS product_name,
+
+    /* Imagen: prioridad variante → thumbnail del line_item → imagen del producto */
+    COALESCE(
+      v.image_url,
+      li.metadata->>'thumbnail',
+      p.image_url
+    ) AS image_url,
+
+    /* Datos de dueño / proveedor */
+    p.owner_id,
+    ow.name  AS owner_name,
+    ow.email AS owner_email,
+
+    /* Etiqueta legible de la variante: "Color · Talla · Otro" */
+    TRIM(BOTH ' ' FROM CONCAT_WS(' · ',
+      NULLIF(v.option1,''),
+      NULLIF(v.option2,''),
+      NULLIF(v.option3,'')
+    )) AS variant_label,
+
+    /* Extra por si quieres mostrar SKU o usarlo luego */
+    v.sku AS variant_sku,
+
+    /* Por si en algún caso quieres usar el thumbnail “crudo” */
+    li.metadata->>'thumbnail' AS thumbnail
+  FROM line_items li
+  LEFT JOIN products p         ON p.id = li.product_id
+  LEFT JOIN product_variants v ON v.id = li.variant_id
+  LEFT JOIN owners ow          ON ow.id = p.owner_id
+  WHERE li.order_id = $1
+  ORDER BY li.id ASC
+`;
+const { rows: items } = await pool.query(itemsQ, [orderId]);
+return { order, items };
+
 }
 
 // === 3DS: entregar ApiKey/Token al frontend (PROTEGIDO)

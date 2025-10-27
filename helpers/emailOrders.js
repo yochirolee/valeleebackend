@@ -7,6 +7,7 @@
 const { Resend } = require('resend');
 const { signDeliveryToken } = require('../helpers/deliveryToken');
 
+
 const resendKey = process.env.RESEND_API_KEY;
 const resend = new Resend(resendKey);
 
@@ -20,8 +21,64 @@ const CLIENT_BASE_URL = process.env.CLIENT_BASE_URL || 'http://localhost:3000';
 // Si guardas rutas relativas para imágenes (p.ej. "/uploads/archivo.jpg"), define esta base pública:
 const PUBLIC_ASSETS_BASE = process.env.PUBLIC_ASSETS_BASE || ''; // ej: https://api.tuapp.com/uploads
 
+const API_BASE_URL = process.env.API_BASE_URL || process.env.CLIENT_BASE_URL || 'http://localhost:4000';
+
+function isObj(x) { return x && typeof x === 'object'; }
+function toStrOrNull(x) { return typeof x === 'string' ? x : null; }
+function toNumOrNull(x) { const n = Number(x); return Number.isFinite(n) ? n : null; }
+
 const safeStatus = (s) => (s ? String(s) : 'pagada');
 const nonce = () => Math.random().toString(36).slice(2, 10);
+// === Helpers de imagen SIN FETCH ===
+// PRIORIDAD para email (solo datos del item):
+// 1) item.image_url  2) metadata.variant_image_url  3) thumbnail  4) source_url
+const pickItemImage = (it) => {
+  const c = (s) => (s && String(s).trim()) || '';
+  return c(it?.image_url)
+    || c(it?.metadata?.variant_image_url)
+    || c(it?.thumbnail)
+    || c(it?.source_url)
+    || '';
+};
+
+// Normaliza para clientes de correo (https, jpg progresivo en Cloudinary)
+function normalizeEmailImg(url) {
+  let out = String(url || '').trim();
+  if (!out) return '';
+  out = out.replace(/\/upload\/(?!.*\/)/, '/upload/f_jpg,q_auto,fl_progressive,c_fill,w_128,h_128,dpr_auto/');
+
+
+  try {
+    const u = new URL(out);
+    if (u.hostname.includes('res.cloudinary.com')) {
+      // jpg progresivo y calidad automática
+      out = out.replace(/\/upload\/(?!.*\/)/, '/upload/f_jpg,q_auto,fl_progressive/');
+      // evita webp en clientes de correo caprichosos
+      out = out.replace(/\.webp(\?|#|$)/i, '.jpg$1');
+    }
+  } catch { }
+  return out;
+}
+
+// Hace absoluta una URL relativa (si tu backend guarda /img/archivo.jpg)
+function toAbs(u) {
+  const s = String(u || '').trim();
+  if (!s) return '';
+  if (/^https?:\/\//i.test(s)) return s;
+  const B = (process.env.PUBLIC_ASSETS_BASE || process.env.CLIENT_BASE_URL || 'http://localhost:3000').replace(/\/+$/, '');
+  return `${B}/${s.replace(/^\/+/, '')}`;
+}
+
+// Enriquecedor SIN FETCH: añade resolved_image_url a cada item
+async function enrichItemsNoFetch(items) {
+  const PLACEHOLDER_URL = 'https://res.cloudinary.com/dz6nhejdd/image/upload/v1761601130/producto-generico_y97whg.webp';
+  return (Array.isArray(items) ? items : []).map(it => {
+    const raw = pickItemImage(it);
+    const abs = toAbs(raw);
+    const url = normalizeEmailImg(abs) || PLACEHOLDER_URL;
+    return { ...it, resolved_image_url: url };
+  });
+}
 
 // ===== Helpers =====
 // Admins que deben recibir siempre el correo de owner.
@@ -48,7 +105,7 @@ function normalizeRecipients(input) {
 }
 
 function thumb64Html(src, alt) {
-  const url = toAbsoluteUrl(src);
+  const url = toAbs(src);
   if (!url) {
     return `<div style="width:64px;height:64px;border:1px solid #eee;border-radius:6px;background:#f8f8f8;"></div>`;
   }
@@ -57,9 +114,10 @@ function thumb64Html(src, alt) {
            style="border-collapse:collapse;width:64px;height:64px;background:#ffffff;border:1px solid #eee;border-radius:6px;">
       <tr>
         <td align="center" valign="middle" style="width:64px;height:64px;line-height:0;">
-          <img src="${esc(url)}" alt="${esc(alt || '')}"
-               style="display:block;border:0;outline:none;text-decoration:none;
-                      max-width:64px;max-height:64px;width:auto;height:auto;border-radius:6px;" />
+          <img src="${esc(url)}" alt="${esc(alt || '')}" width="64" height="64"
+     style="display:block;border:0;outline:none;text-decoration:none;
+            max-width:64px;max-height:64px;width:auto;height:auto;border-radius:6px;" />
+
         </td>
       </tr>
     </table>
@@ -75,18 +133,6 @@ function esc(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
-}
-
-// Convierte URL relativa en absoluta usando una base pública
-function toAbsoluteUrl(u) {
-  if (!u) return null;
-  const s = String(u);
-  if (/^https?:\/\//i.test(s)) return s; // ya es absoluta
-  const base =
-    PUBLIC_ASSETS_BASE ||
-    CLIENT_BASE_URL ||
-    'http://localhost:3000';
-  return `${String(base).replace(/\/+$/, '')}/${s.replace(/^\/+/, '')}`;
 }
 
 // Render helper para dirección (CU/US) + Indicaciones
@@ -143,10 +189,12 @@ function renderAddressHTML(ship) {
 }
 
 function renderOwnerInfoHTML(order) {
-  // Datos directos del headQ:
-  const name = order?.owner_name || '';
-  const email = order?.owner_email || '';
-  const phone = order?.owner_phone || '';
+  // Soporta order.owner {name,phone,whatsapp,email} y/o campos planos
+  const ownerObj = order?.owner || {};
+  const name = order?.owner_name || ownerObj?.name || '';
+  const email = order?.owner_email || ownerObj?.email || '';
+  const phone = order?.owner_phone || ownerObj?.phone || '';
+  const wa = ownerObj?.whatsapp || '';
 
   // Extras desde metadata del owner (si existen)
   const ometa = order?.owner_metadata || {};
@@ -154,7 +202,7 @@ function renderOwnerInfoHTML(order) {
   let address = '';
   try {
     const meta = typeof ometa === 'string' ? JSON.parse(ometa) : (ometa || {});
-    whatsapp = meta.whatsapp || meta.phone_whatsapp || '';
+    whatsapp = wa || meta.whatsapp || meta.phone_whatsapp || '';
     address = meta.address || meta.address_line1 || meta.direction || '';
   } catch { /* noop */ }
 
@@ -244,14 +292,17 @@ function renderCustomerHTML(order, items) {
 
   // tabla de ítems con miniatura
   const lines = (items || []).map((it) => {
-    const img = toAbsoluteUrl(it.image_url);
-    const name = (it.product_name || ('Producto #' + it.product_id));
-    const qty = Number(it.quantity || 0);
+    const baseName = (it.product_name || ('Producto #' + it.product_id));
+    const name = it.variant_label ? `${baseName} · ${it.variant_label}` : baseName;
+    const qty = Number((it.quantity ?? it.qty) || 0);
     const price = Number(it.unit_price || 0).toFixed(2);
+
+    const src = it.resolved_image_url || it.image_url || it.thumbnail || it.source_url || '';
+
     return `
       <tr>
         <td style="padding:6px 0;width:64px;vertical-align:top;">
-        ${thumb64Html(it.image_url, name)}
+          ${thumb64Html(src, name)}
         </td>
         <td style="padding:6px 0 6px 10px;vertical-align:top;">
           <div style="font-size:14px;font-weight:500;margin:0 0 2px 0;">${esc(name)}</div>
@@ -260,6 +311,7 @@ function renderCustomerHTML(order, items) {
       </tr>
     `;
   }).join('');
+
 
   const orderUrl = `${CLIENT_BASE_URL.replace(/\/+$/, '')}/es/orders/${order.id}`;
 
@@ -335,9 +387,9 @@ function renderOwnerHTML(order, items) {
 
   // Ítems con miniatura + descripción (si disponible)
   const lines = (items || []).map((it) => {
-    const img = toAbsoluteUrl(it.image_url);
-    const name = (it.product_name || ('Producto #' + it.product_id));
-    const qty = Number(it.quantity || 0);
+    const baseName = (it.product_name || ('Producto #' + it.product_id));
+    const name = it.variant_label ? `${baseName} · ${it.variant_label}` : baseName;
+    const qty = Number((it.quantity ?? it.qty) || 0);
 
     const desc =
       (typeof it.description === 'string' && it.description.trim()) ? it.description :
@@ -346,10 +398,11 @@ function renderOwnerHTML(order, items) {
             (it?.meta && typeof it.meta.description === 'string' && it.meta.description.trim()) ? it.meta.description :
               null;
 
+    const src = it.resolved_image_url || it.image_url || it.thumbnail || it.source_url || '';
     return `
       <tr>
         <td style="padding:6px 0;width:64px;vertical-align:top;">
-        ${thumb64Html(it.image_url, name)}
+          ${thumb64Html(src, name)}
         </td>
         <td style="padding:6px 0 6px 10px;vertical-align:top;">
           <div style="font-size:14px;font-weight:500;margin:0 0 2px 0;">${esc(name)} · x${qty}</div>
@@ -358,6 +411,7 @@ function renderOwnerHTML(order, items) {
       </tr>
     `;
   }).join('');
+
 
   // Link con token (TTL configurable por env, default 90d)
   const token = signDeliveryToken({
@@ -447,12 +501,13 @@ function renderOwnerHTML(order, items) {
 }
 
 // ===== Envío con Resend =====
-
 async function sendCustomerOrderEmail(to, order, items) {
   if (!resendKey) throw new Error('Missing RESEND_API_KEY');
 
+  // 👇 resuelve imágenes igual que en el front
+  const itemsEnriched = await enrichItemsNoFetch(items || []);
   const subject = `Tu orden #${order.id} — ${safeStatus(order.status)}`;
-  const html = renderCustomerHTML(order, items);
+  const html = renderCustomerHTML(order, itemsEnriched);
   const headers = {
     'X-Order-Id': String(order.id),
     'X-Email-Role': 'customer',
@@ -472,39 +527,29 @@ async function sendCustomerOrderEmail(to, order, items) {
 async function sendOwnerOrderEmail(to, order, items) {
   if (!resendKey) throw new Error('Missing RESEND_API_KEY');
 
+  const itemsEnriched = await enrichItemsNoFetch(items || []);
   const subject = `Nueva orden asignada #${order.id}`;
-  const html = renderOwnerHTML(order, items);
+  const html = renderOwnerHTML(order, itemsEnriched);
   const headers = {
     'X-Order-Id': String(order.id),
     'X-Email-Role': 'owner',
     'X-Entity-Ref-ID': `owner-${order.id}-${nonce()}`,
     'List-Id': `owner-${order.id}.orders.shop.ctenvios.com`,
   };
-
-  // destinatarios del proveedor
   const ownerRecipients = normalizeRecipients(to);
-
-  // si no hay owner, el/los admin reciben el correo en TO (fallback)
-  const finalTo = ownerRecipients.length
-    ? ownerRecipients
-    : (ADMIN_EMAILS.length ? ADMIN_EMAILS : ['soporte@api.ctenvios.com']);
-
-  // si hay owner, admins van en BCC; evita duplicados
+  const finalTo = ownerRecipients.length ? ownerRecipients : (ADMIN_EMAILS.length ? ADMIN_EMAILS : ['soporte@api.ctenvios.com']);
   const bcc = ownerRecipients.length
-    ? ADMIN_EMAILS.filter(
-      admin => !ownerRecipients.some(r => r.toLowerCase() === admin.toLowerCase())
-    )
+    ? ADMIN_EMAILS.filter(a => !ownerRecipients.some(r => r.toLowerCase() === a.toLowerCase()))
     : [];
 
   return await resend.emails.send({
     from: `CTEnvios Online Proveedores <${FROM_OWNER}>`,
-    to: finalTo,             // array o string
+    to: finalTo,
     ...(bcc.length ? { bcc } : {}),
     subject,
     html,
     headers,
   });
 }
-
 
 module.exports = { sendCustomerOrderEmail, sendOwnerOrderEmail };
