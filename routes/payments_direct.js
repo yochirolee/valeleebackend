@@ -108,24 +108,25 @@ async function loadCartItems(client, cartId) {
     SELECT
       ci.id,
       ci.product_id,
+      ci.variant_id,
       ci.quantity,
       ci.unit_price,
-      ci.metadata AS cart_item_metadata,
+      ci.metadata           AS cart_item_metadata,
       p.title,
       p.owner_id,
-      p.price        AS product_price,
-      p.metadata     AS product_metadata,
-      o.name         AS owner_name
+      p.price               AS product_price,
+      p.metadata            AS product_metadata,
+      o.name                AS owner_name
     FROM cart_items ci
-    LEFT JOIN products p ON p.id = ci.product_id
-    LEFT JOIN owners o ON o.id = p.owner_id
+    LEFT JOIN products p          ON p.id = ci.product_id
+    LEFT JOIN product_variants v  ON v.id = ci.variant_id      -- 👈 opcional si más adelante lo usas
+    LEFT JOIN owners o            ON o.id = p.owner_id
     WHERE ci.cart_id = $1
     ORDER BY ci.id ASC
   `;
   const { rows } = await client.query(itemsQ, [cartId]);
   return rows;
 }
-
 
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -395,6 +396,7 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
 
       // guardar snapshots por ítem (los usaremos al insertar line_items)
       groupsByOwner[key].items.push({
+        variant_id: it.variant_id || null, 
         product_id: it.product_id,
         quantity: qty,
         unit_cents: uc,
@@ -495,22 +497,40 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
     await client.query('BEGIN');
     for (const g of Object.values(groupsByOwner)) {
       for (const it of g.items) {
-        const chk = await client.query(`SELECT stock_qty FROM products WHERE id = $1 FOR UPDATE`, [it.product_id]);
-        if (!chk.rows.length) {
-          await client.query('ROLLBACK');
-          return res.status(404).json({ ok: false, message: `Producto ${it.product_id} no encontrado` });
-        }
-        const stock = Number(chk.rows[0].stock_qty || 0);
-        if (stock < Number(it.quantity)) {
-          await client.query('ROLLBACK');
-          return res.status(409).json({
-            ok: false,
-            message: `Stock insuficiente para "${it.title}" (pediste ${it.quantity}, quedan ${stock})`,
-            reason: 'insufficient_stock'
-          });
+        if (it.variant_id) {
+          const chk = await client.query(`SELECT stock_qty FROM product_variants WHERE id = $1 FOR UPDATE`, [it.variant_id]);
+          if (!chk.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ ok: false, message: `Variante ${it.variant_id} no encontrada` });
+          }
+          const stock = Number(chk.rows[0].stock_qty || 0);
+          if (stock < Number(it.quantity)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+              ok: false,
+              message: `Stock insuficiente en la variante (pediste ${it.quantity}, quedan ${stock})`,
+              reason: 'insufficient_stock'
+            });
+          }
+        } else {
+          const chk = await client.query(`SELECT stock_qty FROM products WHERE id = $1 FOR UPDATE`, [it.product_id]);
+          if (!chk.rows.length) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ ok: false, message: `Producto ${it.product_id} no encontrado` });
+          }
+          const stock = Number(chk.rows[0].stock_qty || 0);
+          if (stock < Number(it.quantity)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+              ok: false,
+              message: `Stock insuficiente para "${it.title}" (pediste ${it.quantity}, quedan ${stock})`,
+              reason: 'insufficient_stock'
+            });
+          }
         }
       }
     }
+    
     await client.query('COMMIT');
 
     // 6) Cobro en BMS
@@ -748,28 +768,42 @@ router.post('/bmspay/sale', authenticateToken, async (req, res) => {
         };
 
         await client.query(
-          `INSERT INTO line_items (order_id, product_id, quantity, unit_price, metadata)
-           VALUES ($1, $2, $3, $4, $5::jsonb)`,
+          `INSERT INTO line_items (order_id, product_id, variant_id, quantity, unit_price, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
           [
             orderId,
             it.product_id,
+            it.variant_id || null,                                   // 👈 ahora se guarda
             Number(it.quantity),
-            Number((it.unit_cents / 100).toFixed(2)), // unit_price en USD (como antes)
+            Number((it.unit_cents / 100).toFixed(2)),
             JSON.stringify(lineMeta)
           ]
         );
-
-        const upd = await client.query(
-          `UPDATE products
-              SET stock_qty = stock_qty - $1,
-                  metadata = (COALESCE(metadata,'{}'::jsonb) - 'archived')
-                           || jsonb_build_object('archived', CASE WHEN (stock_qty - $1) <= 0 THEN true ELSE false END)
-            WHERE id = $2 AND stock_qty >= $1`,                     // 👈 ADD condición
-          [Number(it.quantity), it.product_id]
-        );
-        if (upd.rowCount !== 1) {
-          throw new Error(`Race stock for product ${it.product_id}`); // hará ROLLBACK
+        
+        if (it.variant_id) {
+          const upd = await client.query(
+            `UPDATE product_variants
+                SET stock_qty = stock_qty - $1
+              WHERE id = $2 AND stock_qty >= $1`,
+            [Number(it.quantity), it.variant_id]
+          );
+          if (upd.rowCount !== 1) {
+            throw new Error(`Race stock for variant ${it.variant_id}`);
+          }
+        } else {
+          const upd = await client.query(
+            `UPDATE products
+                SET stock_qty = stock_qty - $1,
+                    metadata = (COALESCE(metadata,'{}'::jsonb) - 'archived')
+                             || jsonb_build_object('archived', CASE WHEN (stock_qty - $1) <= 0 THEN true ELSE false END)
+              WHERE id = $2 AND stock_qty >= $1`,
+            [Number(it.quantity), it.product_id]
+          );
+          if (upd.rowCount !== 1) {
+            throw new Error(`Race stock for product ${it.product_id}`);
+          }
         }
+        
 
       }
 

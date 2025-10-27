@@ -9,7 +9,7 @@ const config = {
       : { rejectUnauthorized: false }, // por defecto true, salvo que digas explícitamente false
 
   // 🔧 límites del pool (ajustables por .env)
-  max: parseInt(process.env.PG_POOL_MAX || '20', 10),             // sube si tienes más concurrencia
+  max: parseInt(process.env.PG_POOL_MAX || '20', 10),            
   idleTimeoutMillis: parseInt(process.env.PG_IDLE_MS || '30000', 10),
   connectionTimeoutMillis: parseInt(process.env.PG_CONN_TIMEOUT_MS || '5000', 10),
 

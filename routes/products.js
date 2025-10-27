@@ -460,39 +460,39 @@ router.get('/products/search', async (req, res) => {
 /* ============================
    PRODUCTS BY OWNERS (PUBLIC)
    ============================ */
-   router.get('/products/by-owners', async (req, res) => {
-    const {
-      country,
-      province,
-      area_type,
-      municipality,
-      owners_limit = '8',
-      per_owner = '4',
-      owner_ids, // "1,2,3"
-    } = req.query;
-  
-    // Límites seguros
-    const ownersLim = Math.min(24, Math.max(1, Number(owners_limit) || 8));
-    const perOwnerLim = Math.min(12, Math.max(1, Number(per_owner) || 4));
-  
-    // Parse de owner_ids si viene
-    const ownerIdList = String(owner_ids || '')
-      .split(',')
-      .map(s => Number(s.trim()))
-      .filter(n => Number.isInteger(n) && n > 0);
-  
-    try {
-      const countryNorm = String(country || '').toUpperCase();
-      const prov = String(province || '').trim();
-      const mun = String(municipality || req.query.municipio || '').trim();
-  
-      let params = [];
-      let locationSql = 'TRUE';
-  
-      // Disponibilidad por país + zona (idéntico criterio a /products, pero
-      // aquí *exigimos* owner_id porque agrupamos por dueño).
-      if (countryNorm === 'US') {
-        locationSql = `
+router.get('/products/by-owners', async (req, res) => {
+  const {
+    country,
+    province,
+    area_type,
+    municipality,
+    owners_limit = '8',
+    per_owner = '4',
+    owner_ids, // "1,2,3"
+  } = req.query;
+
+  // Límites seguros
+  const ownersLim = Math.min(24, Math.max(1, Number(owners_limit) || 8));
+  const perOwnerLim = Math.min(12, Math.max(1, Number(per_owner) || 4));
+
+  // Parse de owner_ids si viene
+  const ownerIdList = String(owner_ids || '')
+    .split(',')
+    .map(s => Number(s.trim()))
+    .filter(n => Number.isInteger(n) && n > 0);
+
+  try {
+    const countryNorm = String(country || '').toUpperCase();
+    const prov = String(province || '').trim();
+    const mun = String(municipality || req.query.municipio || '').trim();
+
+    let params = [];
+    let locationSql = 'TRUE';
+
+    // Disponibilidad por país + zona (idéntico criterio a /products, pero
+    // aquí *exigimos* owner_id porque agrupamos por dueño).
+    if (countryNorm === 'US') {
+      locationSql = `
           EXISTS (
             SELECT 1 FROM owner_shipping_config osc
              WHERE osc.owner_id = p.owner_id
@@ -500,26 +500,26 @@ router.get('/products/search', async (req, res) => {
                AND osc.country = 'US'
           )
         `;
-      } else if (countryNorm === 'CU') {
-        const zone = zoneKeyForCuba(prov, area_type);
-        let zoneFixedCol, zoneBaseCol;
-        if (zone === 'habana_city') { zoneFixedCol = 'cu_hab_city_flat'; zoneBaseCol = 'cu_hab_city_base'; }
-        else if (zone === 'habana_municipio') { zoneFixedCol = 'cu_hab_rural_flat'; zoneBaseCol = 'cu_hab_rural_base'; }
-        else if (zone === 'provincias_city') { zoneFixedCol = 'cu_other_city_flat'; zoneBaseCol = 'cu_other_city_base'; }
-        else if (zone === 'provincias_municipio') { zoneFixedCol = 'cu_other_rural_flat'; zoneBaseCol = 'cu_other_rural_base'; }
-  
-        const zoneClause = (zoneFixedCol && zoneBaseCol) ? `
+    } else if (countryNorm === 'CU') {
+      const zone = zoneKeyForCuba(prov, area_type);
+      let zoneFixedCol, zoneBaseCol;
+      if (zone === 'habana_city') { zoneFixedCol = 'cu_hab_city_flat'; zoneBaseCol = 'cu_hab_city_base'; }
+      else if (zone === 'habana_municipio') { zoneFixedCol = 'cu_hab_rural_flat'; zoneBaseCol = 'cu_hab_rural_base'; }
+      else if (zone === 'provincias_city') { zoneFixedCol = 'cu_other_city_flat'; zoneBaseCol = 'cu_other_city_base'; }
+      else if (zone === 'provincias_municipio') { zoneFixedCol = 'cu_other_rural_flat'; zoneBaseCol = 'cu_other_rural_base'; }
+
+      const zoneClause = (zoneFixedCol && zoneBaseCol) ? `
           (
             (osc.mode = 'fixed'  AND osc.${zoneFixedCol} IS NOT NULL)
             OR
             (osc.mode <> 'fixed' AND (osc.cu_rate_per_lb IS NOT NULL OR osc.${zoneBaseCol} IS NOT NULL OR osc.cu_min_fee IS NOT NULL))
           )
         ` : `TRUE`;
-  
-        params.push(prov); const iProv = params.length;
-        params.push(mun);  const iMun  = params.length;
-  
-        locationSql = `
+
+      params.push(prov); const iProv = params.length;
+      params.push(mun); const iMun = params.length;
+
+      locationSql = `
           EXISTS (
             SELECT 1 FROM owner_shipping_config osc
              WHERE osc.owner_id = p.owner_id
@@ -537,10 +537,10 @@ router.get('/products/search', async (req, res) => {
                )
           )
         `;
-      }
-  
-      // Filtro de archivados (idéntico a /products)
-      const archivedClause = `
+    }
+
+    // Filtro de archivados (idéntico a /products)
+    const archivedClause = `
         COALESCE(
           CASE
             WHEN jsonb_typeof(p.metadata->'archived')='boolean' THEN (p.metadata->>'archived')::boolean
@@ -549,20 +549,20 @@ router.get('/products/search', async (req, res) => {
           END
         , false) = false
       `;
-  
-      // Si filtran por owner_ids
-      let ownersFilterSql = 'TRUE';
-      if (ownerIdList.length) {
-        params.push(ownerIdList); // $idx ::int[]
-        ownersFilterSql = `p.owner_id = ANY($${params.length}::int[])`;
-      }
-  
-      // SQL:
-      // 1) src: productos válidos por owner
-      // 2) calc: mismos cálculos de precio que /products
-      // 3) owners_pick: los top owners por cantidad de productos (o por nombre si empata)
-      // 4) ranked: top N productos por owner
-      const sql = `
+
+    // Si filtran por owner_ids
+    let ownersFilterSql = 'TRUE';
+    if (ownerIdList.length) {
+      params.push(ownerIdList); // $idx ::int[]
+      ownersFilterSql = `p.owner_id = ANY($${params.length}::int[])`;
+    }
+
+    // SQL:
+    // 1) src: productos válidos por owner
+    // 2) calc: mismos cálculos de precio que /products
+    // 3) owners_pick: los top owners por cantidad de productos (o por nombre si empata)
+    // 4) ranked: top N productos por owner
+    const sql = `
         WITH src AS (
           SELECT
             p.id, p.title, p.description, p.title_en, p.description_en,
@@ -632,46 +632,46 @@ router.get('/products/search', async (req, res) => {
         WHERE rn <= ${perOwnerLim}
         ORDER BY owner_name ASC, id DESC;
       `;
-  
-      const { rows } = await pool.query(sql, params);
-  
-      // Agrupar en JSON por owner
-      const map = new Map();
-      for (const r of rows) {
-        const key = Number(r.owner_id);
-        if (!map.has(key)) {
-          map.set(key, {
-            owner_id: key,
-            owner_name: r.owner_name || 'Sin dueño',
-            products: [],
-          });
-        }
-        map.get(key).products.push({
-          id: r.id,
-          title: r.title,
-          description: r.description,
-          title_en: r.title_en,
-          description_en: r.description_en,
-          image_url: r.image_url,
-          metadata: r.metadata,
-          stock_qty: r.stock_qty,
-          duty_cents: r.duty_cents,
-          keywords: r.keywords,
-          price_with_margin_cents: r.price_with_margin_cents,
-          tax_cents: r.tax_cents,
-          display_total_cents: r.display_total_cents,
-          display_total_usd: r.display_total_usd,
+
+    const { rows } = await pool.query(sql, params);
+
+    // Agrupar en JSON por owner
+    const map = new Map();
+    for (const r of rows) {
+      const key = Number(r.owner_id);
+      if (!map.has(key)) {
+        map.set(key, {
+          owner_id: key,
+          owner_name: r.owner_name || 'Sin dueño',
+          products: [],
         });
       }
-  
-      res.json({ owners: Array.from(map.values()) });
-    } catch (e) {
-      console.error('GET /products/by-owners error', e);
-      res.status(500).json({ error: 'Error al obtener productos por owner' });
+      map.get(key).products.push({
+        id: r.id,
+        title: r.title,
+        description: r.description,
+        title_en: r.title_en,
+        description_en: r.description_en,
+        image_url: r.image_url,
+        metadata: r.metadata,
+        stock_qty: r.stock_qty,
+        duty_cents: r.duty_cents,
+        keywords: r.keywords,
+        price_with_margin_cents: r.price_with_margin_cents,
+        tax_cents: r.tax_cents,
+        display_total_cents: r.display_total_cents,
+        display_total_usd: r.display_total_usd,
+      });
     }
-  });
 
-  // ===================
+    res.json({ owners: Array.from(map.values()) });
+  } catch (e) {
+    console.error('GET /products/by-owners error', e);
+    res.status(500).json({ error: 'Error al obtener productos por owner' });
+  }
+});
+
+// ===================
 // OWNER DETAILS (PUBLIC)
 // ===================
 router.get('/owners/:id', async (req, res) => {
@@ -741,7 +741,7 @@ router.get('/products/owner/:owner_id', async (req, res) => {
       ` : `TRUE`;
 
       params.push(prov); const iProv = params.length;
-      params.push(mun);  const iMun  = params.length;
+      params.push(mun); const iMun = params.length;
 
       locationSql = `
         EXISTS (
@@ -843,13 +843,13 @@ router.get('/products/owner/:owner_id', async (req, res) => {
 /* ===================
    GET by id (con precios calculados)
    =================== */
-   router.get('/products/:id', async (req, res) => {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id) || id <= 0) return res.status(400).send('Id inválido');
-  
-    try {
-      const sql = `
-        WITH src AS (
+router.get('/products/:id', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).send('Id inválido');
+
+  try {
+    const sql = `
+        WITH prod AS (
           SELECT
             p.id, p.title, p.description, p.title_en, p.description_en,
             p.price, p.weight, p.category_id, p.image_url, p.metadata, p.stock_qty,
@@ -871,23 +871,20 @@ router.get('/products/owner/:owner_id', async (req, res) => {
             END AS taxable,
             COALESCE(NULLIF(metadata->>'tax_pct','')::numeric, 0)            AS tax_pct,
             (COALESCE((metadata->>'price_cents')::int, ROUND(price*100)::int) + COALESCE(duty_cents,0)) AS effective_cents
-          FROM src
+          FROM prod
         )
         SELECT
           id, title, description, title_en, description_en,
           price, weight, category_id, image_url, metadata, stock_qty,
           owner_id, duty_cents, keywords,
   
-          -- precio base + arancel + margen
           ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
           ROUND(ROUND(effective_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd,
   
-          -- impuesto (si aplica)
           CASE WHEN taxable
                THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
                ELSE 0 END AS tax_cents,
   
-          -- total final para UI
           (ROUND(effective_cents * (100 + margin_pct) / 100.0)::int
             + CASE WHEN taxable
                    THEN ROUND((effective_cents * (100 + margin_pct) / 100.0) * tax_pct / 100.0)::int
@@ -903,16 +900,115 @@ router.get('/products/owner/:owner_id', async (req, res) => {
           , 2) AS display_total_usd
         FROM calc;
       `;
-  
-      const { rows } = await pool.query(sql, [id]);
-      if (!rows.length) return res.status(404).send('Producto no encontrado');
-      res.json(rows[0]);
-    } catch (error) {
-      console.error(error);
-      res.status(500).send('Error al obtener producto');
-    }
-  });
-  
+
+    const { rows } = await pool.query(sql, [id]);
+    if (!rows.length) return res.status(404).send('Producto no encontrado');
+    const product = rows[0];
+
+    // =============== NEW: options + variants =================
+    // =============== NEW: options + variants =================
+    const [optRes, varRes] = await Promise.all([
+      pool.query(
+        `SELECT id, position, name, values
+       FROM product_options
+      WHERE product_id = $1
+      ORDER BY position ASC`,
+        [id]
+      ),
+      pool.query(
+        `WITH v AS (
+       SELECT
+         v.id, v.product_id, v.option1, v.option2, v.option3,
+         v.stock_qty, v.archived,
+         COALESCE(v.price_cents, NULL) AS v_price_cents,
+         COALESCE(v.weight, NULL)      AS v_weight,
+         COALESCE(v.image_url, NULL)   AS v_image_url,
+         v.sku,
+         v.metadata
+       FROM product_variants v
+       WHERE v.product_id = $1
+       ORDER BY v.id ASC
+     ),
+     base AS (
+       SELECT
+         v.*,
+         COALESCE(v.v_price_cents,
+                  (p.metadata->>'price_cents')::int,
+                  ROUND(p.price*100)::int) AS base_cents,
+         COALESCE(p.duty_cents, 0)                                          AS duty_cents,
+         COALESCE(NULLIF(p.metadata->>'margin_pct','')::numeric, 0)         AS margin_pct,
+         CASE
+           WHEN jsonb_typeof(p.metadata->'taxable')='boolean' THEN (p.metadata->>'taxable')::boolean
+           WHEN jsonb_typeof(p.metadata->'taxable')='string'  THEN lower(p.metadata->>'taxable') IN ('true','t','yes','1')
+           ELSE true
+         END AS taxable,
+         COALESCE(NULLIF(p.metadata->>'tax_pct','')::numeric, 0)            AS tax_pct,
+         p.weight AS product_weight,
+         p.image_url AS product_image_url
+       FROM v
+       JOIN products p ON p.id = v.product_id
+     )
+     SELECT
+       base.id, base.product_id,
+       base.option1, base.option2, base.option3,
+       base.stock_qty, base.archived,
+       base.v_image_url AS image_url,
+       base.sku,
+       base.metadata,
+       COALESCE(base.v_weight, base.product_weight)  AS weight,
+       COALESCE(base.v_image_url, base.product_image_url) AS effective_image,
+       ROUND((base.base_cents + base.duty_cents) * (100 + base.margin_pct) / 100.0)::int AS price_with_margin_cents,
+       CASE WHEN base.taxable
+            THEN ROUND(((base.base_cents + base.duty_cents) * (100 + base.margin_pct) / 100.0) * base.tax_pct / 100.0)::int
+            ELSE 0 END AS tax_cents,
+       (
+         ROUND((base.base_cents + base.duty_cents) * (100 + base.margin_pct) / 100.0)::int
+         + CASE WHEN base.taxable
+                THEN ROUND(((base.base_cents + base.duty_cents) * (100 + base.margin_pct) / 100.0) * base.tax_pct / 100.0)::int
+                ELSE 0 END
+       ) AS display_total_cents,
+       ROUND(
+         (
+           ROUND((base.base_cents + base.duty_cents) * (100 + base.margin_pct) / 100.0)::numeric
+           + CASE WHEN base.taxable
+                  THEN ROUND(((base.base_cents + base.duty_cents) * (100 + base.margin_pct) / 100.0) * base.tax_pct / 100.0)::numeric
+                  ELSE 0 END
+         ) / 100.0
+       , 2) AS display_total_usd
+     FROM base
+     ORDER BY base.id ASC;`,
+        [id]
+      ),
+    ])
+
+    return res.json({
+      ...product,
+      options: optRes.rows,
+      variants: varRes.rows.map(v => ({
+        id: v.id,
+        product_id: v.product_id,
+        option1: v.option1,
+        option2: v.option2,
+        option3: v.option3,
+        stock_qty: v.stock_qty,
+        archived: v.archived,
+        image_url: v.image_url,
+        sku: v.sku,
+        metadata: v.metadata,
+        weight: Number(v.weight),
+        price_with_margin_cents: v.price_with_margin_cents,
+        tax_cents: v.tax_cents,
+        display_total_cents: v.display_total_cents,
+        display_total_usd: v.display_total_usd,
+      })),
+    })
+      ;
+  } catch (error) {
+    console.error(error);
+    res.status(500).send('Error al obtener producto');
+  }
+});
+
 
 /* ===================
    CREATE (admin)
@@ -1278,5 +1374,190 @@ router.get('/products/category/:slug', async (req, res) => {
     res.status(500).send('Error al obtener productos por categoría');
   }
 });
+
+/* ===========================
+   ADMIN - Product Options (1..3)
+   =========================== */
+// ========== ADMIN - GET options de un producto ==========
+router.get('/admin/products/:id/options', authenticateToken, requireAdmin, async (req, res) => {
+  const productId = Number(req.params.id);
+  if (!Number.isInteger(productId) || productId <= 0) {
+    return res.status(400).json({ error: 'product id inválido' });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, position, name, values
+         FROM product_options
+        WHERE product_id = $1
+        ORDER BY position ASC`,
+      [productId]
+    );
+    res.json({ options: rows });
+  } catch (e) {
+    console.error('GET /admin/products/:id/options', e);
+    res.status(500).json({ error: 'Error obteniendo opciones' });
+  }
+});
+
+// ========== ADMIN - GET variants de un producto ==========
+router.get('/admin/products/:id/variants', authenticateToken, requireAdmin, async (req, res) => {
+  const productId = Number(req.params.id);
+  if (!Number.isInteger(productId) || productId <= 0) {
+    return res.status(400).json({ error: 'product id inválido' });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         id, product_id, option1, option2, option3,
+         stock_qty, archived, image_url, sku, weight, price_cents, metadata,
+         created_at, updated_at
+       FROM product_variants
+       WHERE product_id = $1
+       ORDER BY id ASC`,
+      [productId]
+    );
+    // Para el front que espera array directo:
+    res.json({ variants: rows });
+  } catch (e) {
+    console.error('GET /admin/products/:id/variants', e);
+    res.status(500).json({ error: 'Error obteniendo variantes' });
+  }
+});
+
+router.post('/admin/products/:id/options', authenticateToken, requireAdmin, async (req, res) => {
+  const productId = Number(req.params.id);
+  const { options } = req.body; // [{position:1..3, name:'Talla', values:['S','M','L']}]
+
+  if (!Number.isInteger(productId) || productId <= 0) return res.status(400).json({ error: 'product id inválido' });
+  if (!Array.isArray(options) || options.length === 0) return res.status(400).json({ error: 'options requerido' });
+
+  const clean = [];
+  for (const o of options) {
+    const pos = Number(o.position);
+    const name = String(o.name || '').trim();
+    const values = Array.isArray(o.values) ? o.values.map(s => String(s).trim()).filter(Boolean) : [];
+    if (!Number.isInteger(pos) || pos < 1 || pos > 3) return res.status(400).json({ error: 'position inválida' });
+    if (!name) return res.status(400).json({ error: 'name requerido' });
+    clean.push({ position: pos, name, values });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // upsert por position
+    for (const o of clean) {
+      await client.query(
+        `INSERT INTO product_options (product_id, position, name, values)
+             VALUES ($1,$2,$3,$4)
+           ON CONFLICT (product_id, position)
+           DO UPDATE SET name = EXCLUDED.name, values = EXCLUDED.values, updated_at = NOW()`,
+        [productId, o.position, o.name, o.values]
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('POST /admin/products/:id/options', e);
+    res.status(500).json({ error: 'Error guardando opciones' });
+  } finally {
+    client.release();
+  }
+});
+
+/* ===========================
+   ADMIN - Variants CRUD
+   =========================== */
+router.post('/admin/products/:id/variants', authenticateToken, requireAdmin, async (req, res) => {
+  const productId = Number(req.params.id);
+  const {
+    option1 = null, option2 = null, option3 = null,
+    price_cents = null, weight = null, image_url = null, sku = null,
+    stock_qty = 0, archived = false, metadata = {}
+  } = req.body || {};
+
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO product_variants (
+           product_id, option1, option2, option3,
+           price_cents, weight, image_url, sku,
+           stock_qty, archived, metadata
+         )
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         RETURNING *`,
+      [productId, option1, option2, option3,
+        price_cents, weight, image_url, sku,
+        Number(stock_qty) || 0, archived === true, metadata || {}]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    console.error('POST /admin/products/:id/variants', e);
+    // conflicto de combinación única
+    if (e?.code === '23505') return res.status(409).json({ error: 'Variante duplicada (misma combinación)' });
+    res.status(500).json({ error: 'Error creando variante' });
+  }
+});
+
+router.put('/admin/variants/:variant_id', authenticateToken, requireAdmin, async (req, res) => {
+  const variantId = Number(req.params.variant_id);
+  if (!Number.isInteger(variantId) || variantId <= 0) return res.status(400).json({ error: 'variant id inválido' });
+
+  const {
+    option1, option2, option3,
+    price_cents, weight, image_url, sku,
+    stock_qty, archived, metadata
+  } = req.body || {};
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE product_variants
+            SET option1     = COALESCE($1, option1),
+                option2     = COALESCE($2, option2),
+                option3     = COALESCE($3, option3),
+                price_cents = COALESCE($4, price_cents),
+                weight      = COALESCE($5, weight),
+                image_url   = COALESCE($6, image_url),
+                sku         = COALESCE($7, sku),
+                stock_qty   = COALESCE($8, stock_qty),
+                archived    = COALESCE($9, archived),
+                metadata    = COALESCE(metadata,'{}'::jsonb) || COALESCE($10::jsonb,'{}'::jsonb)
+          WHERE id = $11
+          RETURNING *`,
+      [option1 ?? null, option2 ?? null, option3 ?? null,
+      price_cents ?? null, weight ?? null, image_url ?? null, sku ?? null,
+      (stock_qty == null ? null : Number(stock_qty)),
+      (archived == null ? null : !!archived),
+      metadata ? JSON.stringify(metadata) : null,
+        variantId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Variante no encontrada' });
+    res.json(rows[0]);
+  } catch (e) {
+    console.error('PUT /admin/variants/:variant_id', e);
+    if (e?.code === '23505') return res.status(409).json({ error: 'Variante duplicada (misma combinación)' });
+    res.status(500).json({ error: 'Error actualizando variante' });
+  }
+});
+
+router.delete('/admin/variants/:variant_id', authenticateToken, requireAdmin, async (req, res) => {
+  const variantId = Number(req.params.variant_id);
+  if (!Number.isInteger(variantId) || variantId <= 0) return res.status(400).json({ error: 'variant id inválido' });
+
+  try {
+    // si hay line_items referenciando la variante, sugerimos archivar
+    const dep = await pool.query('SELECT 1 FROM line_items WHERE variant_id = $1 LIMIT 1', [variantId]);
+    if (dep.rows.length) {
+      await pool.query(`UPDATE product_variants SET archived = TRUE WHERE id = $1`, [variantId]);
+      return res.json({ archived: true, id: variantId });
+    }
+    const del = await pool.query('DELETE FROM product_variants WHERE id = $1 RETURNING id', [variantId]);
+    if (!del.rows.length) return res.status(404).json({ error: 'Variante no encontrada' });
+    res.json({ deleted: true, id: del.rows[0].id });
+  } catch (e) {
+    console.error('DELETE /admin/variants/:variant_id', e);
+    res.status(500).json({ error: 'Error eliminando variante' });
+  }
+});
+
 
 module.exports = router

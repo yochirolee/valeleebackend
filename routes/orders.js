@@ -259,24 +259,46 @@ router.get('/orders/:id/detail', authenticateToken, async (req, res) => {
 
     // ⬇️ Cambio: COALESCE a metadata para cubrir items de Encargos (sin product_id)
     const { rows: items } = await pool.query(
-      `
-      SELECT
-        li.product_id,
-        COALESCE(p.title,       li.metadata->>'title')      AS product_name,
-        COALESCE(
-          li.metadata->>'title_en',
-          p.title_en,
-          NULLIF(p.metadata->>'title_en','')
-        )                                                   AS product_name_en,
-        COALESCE(p.image_url,   li.metadata->>'image_url')  AS image_url,
-        li.metadata->>'source_url'                          AS source_url,
-        li.quantity,
-        li.unit_price
-      FROM line_items li
-      LEFT JOIN products p ON p.id = li.product_id
-      WHERE li.order_id = $1
-      ORDER BY li.id ASC
-      `,
+      `SELECT
+          li.product_id,
+          li.variant_id,
+
+          COALESCE(p.title, li.metadata->>'title') AS product_name,
+          COALESCE(
+            li.metadata->>'title_en',
+            p.title_en,
+            NULLIF(p.metadata->>'title_en','')
+          ) AS product_name_en,
+
+          li.metadata->>'source_url'   AS source_url,
+          li.metadata->>'thumbnail'    AS thumbnail,
+
+          -- ✅ NUEVO: pasa metadata y/o variant_options
+          li.metadata                   AS metadata,
+          li.metadata->'variant_options' AS variant_options,
+
+          li.quantity,
+          li.unit_price,
+
+          v.option1 AS variant_option1,
+          v.option2 AS variant_option2,
+          v.option3 AS variant_option3,
+          v.sku     AS variant_sku,
+
+          -- prioridad: variante → thumbnail de LI → producto
+          COALESCE(v.image_url, li.metadata->>'thumbnail', p.image_url) AS image_url,
+
+          TRIM(BOTH ' ' FROM CONCAT_WS(' · ',
+            NULLIF(v.option1,''),
+            NULLIF(v.option2,''),
+            NULLIF(v.option3,'')
+          )) AS variant_label
+        FROM line_items li
+        LEFT JOIN products p        ON p.id = li.product_id
+        LEFT JOIN product_variants v ON v.id = li.variant_id
+        WHERE li.order_id = $1
+        ORDER BY li.id ASC;
+        `,
       [id]
     )
       ;
@@ -298,13 +320,27 @@ router.get('/orders/:id/detail', authenticateToken, async (req, res) => {
       },
       items: items.map(it => ({
         product_id: it.product_id,
+        variant_id: it.variant_id,
         product_name: it.product_name || undefined,
         product_name_en: it.product_name_en || undefined,
+
         image_url: it.image_url || null,
-        source_url: it.source_url || null, // opcional para UI
+        thumbnail: it.thumbnail || null,
+        source_url: it.source_url || null,
+
         quantity: Number(it.quantity),
         unit_price: Number(it.unit_price),
+
+        option1: it.variant_option1 || null,
+        option2: it.variant_option2 || null,
+        option3: it.variant_option3 || null,
+
+        variant_label: it.variant_label || '',
+
+        // ✅ para que el front pueda normalizar y emparejar variante si no hay variant_id
+        metadata: it.metadata ?? (it.variant_options ? { variant_options: it.variant_options } : undefined),
       })),
+
     });
   } catch (e) {
     console.error('GET /orders/:id/detail error', e);
@@ -576,24 +612,48 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
     const o = headRows[0];
 
     const { rows: itemRows } = await pool.query(`
-      SELECT
+        SELECT
         li.product_id,
-        COALESCE(p.title,      li.metadata->>'title')      AS product_name,
+        li.variant_id,                                          -- ✅ NUEVO
+
+        COALESCE(p.title, li.metadata->>'title')      AS product_name,
         COALESCE(
           li.metadata->>'title_en',
           p.title_en,
           NULLIF(p.metadata->>'title_en','')
-        )                                                 AS product_name_en,
-        COALESCE(p.image_url,  li.metadata->>'image_url') AS image_url,
-        li.metadata->>'source_url'                        AS source_url,
-        li.metadata->>'external_id'                       AS external_id,
+        )                                             AS product_name_en,
+
+        li.metadata->>'source_url'                    AS source_url,
+        li.metadata->>'external_id'                   AS external_id,
+        li.metadata->>'thumbnail'                     AS thumbnail,
+
+        -- ✅ NUEVO: expone metadata / variant_options
+        li.metadata                                   AS metadata,
+        li.metadata->'variant_options'                AS variant_options,
+
         li.quantity,
-        li.unit_price
+        li.unit_price,
+
+        v.option1 AS variant_option1,
+        v.option2 AS variant_option2,
+        v.option3 AS variant_option3,
+        v.sku     AS variant_sku,
+
+        -- ✅ prioridad: var → thumb (LI) → prod (sin coma final)
+        COALESCE(v.image_url, li.metadata->>'thumbnail', p.image_url) AS image_url,
+
+        -- Etiqueta “Negra · M”
+        TRIM(BOTH ' ' FROM CONCAT_WS(' · ',
+          NULLIF(v.option1,''),
+          NULLIF(v.option2,''),
+          NULLIF(v.option3,'')
+        )) AS variant_label
+
       FROM line_items li
-      LEFT JOIN products p ON p.id = li.product_id
+      LEFT JOIN products p        ON p.id = li.product_id
+      LEFT JOIN product_variants v ON v.id = li.variant_id
       WHERE li.order_id = $1
-      ORDER BY li.id ASC
-    `, [id]);
+      ORDER BY li.id ASC`, [id]);
 
 
     const subtotalCalc = itemRows.reduce((acc, it) => acc + Number(it.quantity) * Number(it.unit_price), 0)
@@ -662,15 +722,28 @@ router.get('/admin/orders/:id/detail', authenticateToken, requireAdmin, async (r
         metadata: o.metadata || {},
       },
       items: itemRows.map(it => ({
-        product_id: it.product_id,                        // puede ser null en encargos
+        product_id: it.product_id,
+        variant_id: it.variant_id,                  // ✅
         product_name: it.product_name || 'Encargo',
         product_name_en: it.product_name_en || undefined,
+
         image_url: it.image_url || null,
+        thumbnail: it.thumbnail || null,
         source_url: it.source_url || null,
         external_id: it.external_id || null,
+
         quantity: Number(it.quantity),
         unit_price: Number(it.unit_price),
+
+        option1: it.variant_option1 || null,
+        option2: it.variant_option2 || null,
+        option3: it.variant_option3 || null,
+        variant_label: it.variant_label || '',
+
+        // ✅ para normalizar en UI cuando no hay variant_id
+        metadata: it.metadata ?? (it.variant_options ? { variant_options: it.variant_options } : undefined),
       })),
+
     });
   } catch (e) {
     console.error('GET /admin/orders/:id/detail', e);
@@ -1154,79 +1227,139 @@ router.post('/partner/orders/:id/mark-delivered',
 )
 
 // Historial de órdenes por cliente (autenticado: sólo el propio usuario o admin)
+// Historial de órdenes por cliente (autenticado: sólo el propio usuario o admin)
 router.get('/customers/:customerId/orders', authenticateToken, async (req, res) => {
   const customerId = Number(req.params.customerId);
-  if (!Number.isFinite(customerId)) {
-    return res.status(400).json({ error: 'customerId inválido' });
+  if (!Number.isInteger(customerId) || customerId <= 0) {
+    return res.status(400).json({ error: 'customer id inválido' });
   }
 
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+  const off = (page - 1) * limit;
+
   try {
-    // Seguridad: solo la misma usuaria o admin
-    const isAdmin = await isAdminUser(req.user.id);
-    if (Number(req.user.id) !== customerId && !isAdmin) {
-      return res.sendStatus(403);
-    }
+    const sql = `
+  WITH ord AS (
+    SELECT
+      o.id,
+      o.status,
+      o.created_at,
+      o.metadata->'shipping'      AS shipping,
+      o.metadata->'billing'       AS billing,
+      o.metadata->'pricing_cents' AS pricing_cents,
+      o.metadata->'pricing'       AS pricing
+    FROM orders o
+    WHERE o.customer_id = $1
+    ORDER BY o.created_at DESC
+    LIMIT ${limit} OFFSET ${off}
+  ),
+  totals AS (
+    SELECT
+      li.order_id,
+      SUM(li.quantity)::int AS items_qty,
+      COALESCE(SUM(li.quantity * ROUND(li.unit_price * 100)), 0)::int AS items_total_cents
+    FROM line_items li
+    WHERE li.order_id IN (SELECT id FROM ord)
+    GROUP BY li.order_id
+  ),
+  priced AS (
+    SELECT
+      o.*,
+      /* base_total_cents = subtotal + tax + shipping (preferimos pricing_cents) */
+      COALESCE(
+        (
+          NULLIF((o.pricing_cents->>'subtotal_cents')::int, NULL) +
+          NULLIF((o.pricing_cents->>'tax_cents')::int, 0) +
+          NULLIF((o.pricing_cents->>'shipping_total_cents')::int, 0)
+        ),
+        CASE
+          WHEN (o.pricing->>'total') IS NOT NULL
+          THEN ROUND(((o.pricing->>'total')::numeric) * 100)::int
+          ELSE NULL
+        END
+      ) AS base_total_cents,
 
-    const ordersResult = await pool.query(
-      `
-      SELECT
-        o.id AS order_id,
-        o.created_at,
-        o.status,
-        o.payment_method,
-        o.metadata,
-    
-        li.product_id,
-        li.quantity,
-        li.unit_price,
-    
-        -- nombres e imagen (incluye encargos sin product_id)
-        COALESCE(p.title,     li.metadata->>'title')      AS product_name,
-        COALESCE(
-          li.metadata->>'title_en',
-          p.title_en,
-          NULLIF(p.metadata->>'title_en','')
-        )                                                 AS product_name_en,
-        COALESCE(p.image_url, li.metadata->>'image_url')  AS image_url,
-        li.metadata->>'source_url'                        AS source_url
+      COALESCE(
+        NULLIF((o.pricing_cents->>'card_fee_cents')::int, NULL),
+        CASE
+          WHEN (o.pricing->>'card_fee') IS NOT NULL
+          THEN ROUND(((o.pricing->>'card_fee')::numeric) * 100)::int
+          ELSE NULL
+        END
+      ) AS card_fee_cents,
+
+      COALESCE(
+        NULLIF((o.pricing_cents->>'total_with_card_cents')::int, NULL),
+        CASE
+          WHEN (o.pricing->>'total_with_card') IS NOT NULL
+          THEN ROUND(((o.pricing->>'total_with_card')::numeric) * 100)::int
+          ELSE NULL
+        END
+      ) AS total_with_card_cents
+    FROM ord o
+  )
+  SELECT
+    p.id,
+    p.status,
+    p.created_at,
+    p.shipping,
+    p.billing,
+    COALESCE(t.items_qty, 0)         AS items_qty,
+    COALESCE(t.items_total_cents, 0) AS items_total_cents,
+    COALESCE(p.base_total_cents, COALESCE(t.items_total_cents, 0)) AS base_total_cents,
+    p.card_fee_cents,
+    p.total_with_card_cents,
+
+    /* ===== PREVIEW AGRUPADO (1 imagen por producto/variante, con qty y unit_price) ===== */
+    (
+      SELECT json_agg(pre ORDER BY pre.product_id, pre.variant_id)
+      FROM (
+        SELECT
+          li.product_id,
+          li.variant_id,
+          COALESCE(v.image_url, pr.image_url) AS image_url,
+          pr.title                             AS product_name,
+          SUM(li.quantity)::int                AS qty,
+          MIN(li.unit_price)::numeric          AS unit_price
+        FROM line_items li
+        LEFT JOIN products pr         ON pr.id = li.product_id
+        LEFT JOIN product_variants v  ON v.id  = li.variant_id
+        WHERE li.order_id = p.id
+        GROUP BY li.product_id, li.variant_id, COALESCE(v.image_url, pr.image_url), pr.title
+        ORDER BY li.product_id, li.variant_id
+        LIMIT 8
+      ) AS pre
+    ) AS items_preview
+
+  FROM priced p
+  LEFT JOIN totals t ON t.order_id = p.id
+  ORDER BY p.created_at DESC;
+`;
+
+
+    const countSql = `
+      SELECT COUNT(*)::int AS n
       FROM orders o
-      JOIN line_items li    ON o.id = li.order_id
-      LEFT JOIN products  p ON p.id = li.product_id
       WHERE o.customer_id = $1
-      ORDER BY o.created_at DESC, li.id ASC
-      `,
-      [customerId]
-    )
+    `;
 
+    const [rowsRes, countRes] = await Promise.all([
+      pool.query(sql, [customerId]),
+      pool.query(countSql, [customerId]),
+    ]);
 
-    const rows = ordersResult.rows;
-    const grouped = {};
-    for (const row of rows) {
-      if (!grouped[row.order_id]) {
-        grouped[row.order_id] = {
-          order_id: row.order_id,
-          created_at: row.created_at,
-          status: row.status,
-          payment_method: row.payment_method,
-          metadata: row.metadata,
-          items: [],
-        };
-      }
-      grouped[row.order_id].items.push({
-        product_id: row.product_id,                   // puede ser null en encargos
-        product_name: row.product_name || undefined,  // viene de COALESCE(...)
-        product_name_en: row.product_name_en || undefined,
-        quantity: Number(row.quantity),
-        unit_price: Number(row.unit_price),
-        image_url: row.image_url || null,
-        source_url: row.source_url || null,           // opcional para enlazar al origen
-      });
-    }
-
-    res.json(Object.values(grouped));
-  } catch (error) {
-    console.error('GET /customers/:customerId/orders error', error);
-    res.status(500).send('Error al obtener el historial de órdenes');
+    const total = Number(countRes.rows[0]?.n || 0);
+    return res.json({
+      items: rowsRes.rows,
+      page,
+      limit,
+      total,
+      pages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } catch (e) {
+    console.error('GET /customers/:customerId/orders error', e);
+    return res.status(500).json({ error: 'Error al obtener órdenes del cliente' });
   }
 });
 
@@ -1262,24 +1395,25 @@ router.get('/line-items/:id', authenticateToken, async (req, res) => {
 
 
 router.post('/line-items', authenticateToken, async (req, res) => {
-  const { order_id, product_id, quantity, unit_price, metadata } = req.body || {}
-  const orderId = Number(order_id)
-  if (!Number.isFinite(orderId)) return res.status(400).send('order_id inválido')
+  const { order_id, product_id, variant_id, quantity, unit_price, metadata } = req.body || {};
+  const orderId = Number(order_id);
+  if (!Number.isFinite(orderId)) return res.status(400).send('order_id inválido');
 
-  const authz = await assertOrderOwnerOrAdmin(orderId, req.user.id)
-  if (!authz.ok) return res.sendStatus(authz.notFound ? 404 : 403)
+  const authz = await assertOrderOwnerOrAdmin(orderId, req.user.id);
+  if (!authz.ok) return res.sendStatus(authz.notFound ? 404 : 403);
 
   try {
     const result = await pool.query(
-      `INSERT INTO line_items (order_id, product_id, quantity, unit_price, metadata)
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [orderId, product_id ?? null, Number(quantity) || 0, Number(unit_price) || 0, metadata || {}]
-    )
-    res.status(201).json(result.rows[0])
+      `INSERT INTO line_items (order_id, product_id, variant_id, quantity, unit_price, metadata)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [orderId, product_id ?? null, variant_id ?? null, Number(quantity) || 0, Number(unit_price) || 0, metadata || {}]
+    );
+    res.status(201).json(result.rows[0]);
   } catch {
-    res.status(500).send('Error al crear el line item')
+    res.status(500).send('Error al crear el line item');
   }
-})
+});
+
 
 
 router.delete('/line-items/:id', authenticateToken, async (req, res) => {

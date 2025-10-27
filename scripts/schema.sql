@@ -223,7 +223,8 @@ CREATE INDEX IF NOT EXISTS idx_orders_delivered_at ON orders (delivered_at DESC)
 CREATE INDEX IF NOT EXISTS idx_orders_owner_paid ON orders (owner_paid);
 CREATE INDEX IF NOT EXISTS idx_orders_owner_payout_id ON orders (owner_payout_id);
 
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
 
 -- === Productos: multi-idioma, arancel y keywords ===
 ALTER TABLE products
@@ -723,3 +724,163 @@ WHERE s.country = 'CU' AND s.cu_transport = 'sea'
   );
 
 COMMIT;
+
+BEGIN;
+
+-- ------------------------------------------------------------
+-- 1) Mover la extensión pg_trgm fuera de "public"
+--    (El linter no quiere extensiones en "public")
+-- ------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS extensions;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_extension e
+    JOIN pg_namespace n ON n.oid = e.extnamespace
+    WHERE e.extname = 'pg_trgm' AND n.nspname = 'public'
+  ) THEN
+    EXECUTE 'ALTER EXTENSION pg_trgm SET SCHEMA extensions';
+  END IF;
+END $$;
+
+-- ------------------------------------------------------------
+-- 2) Fijar search_path en funciones marcadas por el linter
+--    (Evita "role mutable search_path")
+--    Valor recomendado: pg_catalog, public
+-- ------------------------------------------------------------
+DO $$
+DECLARE
+  r RECORD;
+BEGIN
+  FOR r IN
+    SELECT
+      n.nspname   AS schema,
+      p.proname   AS name,
+      pg_catalog.pg_get_function_identity_arguments(p.oid) AS args
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname IN (
+        'set_updated_at',
+        'trg_enforce_single_default_recipient',
+        'set_updated_at_customers',
+        'set_unique_default_recipient'
+      )
+  LOOP
+    EXECUTE format(
+      'ALTER FUNCTION %I.%I(%s) SET search_path = pg_catalog, public',
+      r.schema, r.name, r.args
+    );
+  END LOOP;
+END $$;
+
+COMMIT;
+
+-- ===========================================
+-- VARIANTS: tablas nuevas + columnas nuevas
+-- ===========================================
+
+-- 1) Opciones por producto (hasta 3 como Shopify)
+CREATE TABLE IF NOT EXISTS product_options (
+  id          SERIAL PRIMARY KEY,
+  product_id  INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  position    INT NOT NULL CHECK (position BETWEEN 1 AND 3),
+  name        TEXT NOT NULL,
+  values      TEXT[] NOT NULL DEFAULT '{}',
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_product_options_product_pos
+  ON product_options(product_id, position);
+
+-- 2) Variantes (precio en centavos)
+CREATE TABLE IF NOT EXISTS product_variants (
+  id           SERIAL PRIMARY KEY,
+  product_id   INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+
+  -- combinación de opciones (nullable)
+  option1      TEXT NULL,
+  option2      TEXT NULL,
+  option3      TEXT NULL,
+
+  -- overrides (NULL = hereda del producto)
+  price_cents  INT NULL CHECK (price_cents IS NULL OR price_cents >= 0),
+  weight       NUMERIC NULL,
+  image_url    TEXT NULL,
+  sku          TEXT NULL,
+
+  stock_qty    INT NOT NULL DEFAULT 0 CHECK (stock_qty >= 0),
+  archived     BOOLEAN NOT NULL DEFAULT FALSE,
+
+  metadata     JSONB NULL,
+
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_variants_product ON product_variants(product_id);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_variants_combo
+  ON product_variants(product_id, option1, option2, option3);
+
+-- índice parcial para listados rápidos (solo activas)
+CREATE INDEX IF NOT EXISTS ix_variants_active
+  ON product_variants(product_id, id)
+  WHERE archived = FALSE;
+
+-- 3) Cart items y line items referencian variante (nullable)
+ALTER TABLE IF EXISTS cart_items
+  ADD COLUMN IF NOT EXISTS variant_id INT NULL;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='cart_items')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='cart_items_variant_id_fkey') THEN
+    ALTER TABLE cart_items
+      ADD CONSTRAINT cart_items_variant_id_fkey
+      FOREIGN KEY (variant_id) REFERENCES product_variants(id);
+  END IF;
+END $$;
+
+ALTER TABLE IF EXISTS line_items
+  ADD COLUMN IF NOT EXISTS variant_id INT NULL;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='line_items')
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='line_items_variant_id_fkey') THEN
+    ALTER TABLE line_items
+      ADD CONSTRAINT line_items_variant_id_fkey
+      FOREIGN KEY (variant_id) REFERENCES product_variants(id);
+  END IF;
+END $$;
+
+-- 4) Trigger para updated_at
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_product_options_updated ON product_options;
+CREATE TRIGGER trg_product_options_updated
+BEFORE UPDATE ON product_options
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+DROP TRIGGER IF EXISTS trg_product_variants_updated ON product_variants;
+CREATE TRIGGER trg_product_variants_updated
+BEFORE UPDATE ON product_variants
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- (Opcional) Vista de precio efectivo en centavos: usa variant.price_cents si existe,
+-- si no, cae al precio del producto (products.price * 100).
+CREATE OR REPLACE VIEW v_product_variant_effective_price_cents AS
+SELECT
+  v.id          AS variant_id,
+  v.product_id,
+  COALESCE(v.price_cents, ROUND(p.price * 100)::INT) AS effective_price_cents
+FROM product_variants v
+JOIN products p ON p.id = v.product_id;
+
