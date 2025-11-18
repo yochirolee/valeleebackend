@@ -115,7 +115,7 @@ router.get('/products', async (req, res) => {
       WITH src AS (
         SELECT
           id, title, description, title_en, description_en,
-          price, weight, category_id, image_url,
+          price, weight, category_id, image_url, link,
           metadata, stock_qty, owner_id,
           duty_cents, keywords
         FROM products
@@ -138,7 +138,7 @@ router.get('/products', async (req, res) => {
       )
       SELECT
         id, title, description, title_en, description_en,
-        price, weight, category_id, image_url,
+        price, weight, category_id, image_url, link,
         metadata, stock_qty, owner_id,
         duty_cents, keywords,
 
@@ -261,7 +261,7 @@ router.get('/products/best-sellers', async (req, res) => {
       ),
       src AS (
         SELECT p.id, p.title, p.description, p.title_en, p.description_en,
-               p.price, p.weight, p.category_id, p.image_url, p.metadata, p.stock_qty,
+               p.price, p.weight, p.category_id, p.image_url, p.link, p.metadata, p.stock_qty,
                p.owner_id, p.duty_cents, p.keywords,
                COALESCE(r.sold_qty, 0) AS sold_qty
           FROM products p
@@ -286,7 +286,7 @@ router.get('/products/best-sellers', async (req, res) => {
       )
       SELECT
         id, title, description, title_en, description_en,
-        price, weight, category_id, image_url, metadata, stock_qty,
+        price, weight, category_id, image_url, link, metadata, stock_qty,
         owner_id, duty_cents, keywords,
         sold_qty,
         ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
@@ -421,7 +421,7 @@ router.get('/products/search', async (req, res) => {
         SELECT
           p.id, p.title, p.description, p.title_en, p.description_en,
           p.price, p.weight, p.category_id,
-          p.image_url, p.metadata, p.stock_qty, p.owner_id,
+          p.image_url, p.link, p.metadata, p.stock_qty, p.owner_id,
           p.duty_cents, p.keywords
         FROM products p
         ${whereSql}
@@ -439,7 +439,7 @@ router.get('/products/search', async (req, res) => {
       )
       SELECT
         id, title, description, title_en, description_en,
-        price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+        price, weight, category_id, image_url, link, metadata, stock_qty, owner_id,
         duty_cents, keywords,
         ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
         ROUND(ROUND(effective_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd
@@ -852,7 +852,7 @@ router.get('/products/:id', async (req, res) => {
         WITH prod AS (
           SELECT
             p.id, p.title, p.description, p.title_en, p.description_en,
-            p.price, p.weight, p.category_id, p.image_url, p.metadata, p.stock_qty,
+            p.price, p.weight, p.category_id, p.image_url, p.link, p.metadata, p.stock_qty,
             p.owner_id, p.duty_cents, p.keywords
           FROM products p
           WHERE p.id = $1
@@ -875,7 +875,7 @@ router.get('/products/:id', async (req, res) => {
         )
         SELECT
           id, title, description, title_en, description_en,
-          price, weight, category_id, image_url, metadata, stock_qty,
+          price, weight, category_id, image_url, link, metadata, stock_qty,
           owner_id, duty_cents, keywords,
   
           ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
@@ -1016,7 +1016,7 @@ router.get('/products/:id', async (req, res) => {
 router.post('/products', authenticateToken, requireAdmin, async (req, res) => {
   const {
     title, price, weight, category_id, image_url, description, stock_qty, owner_id,
-    title_en, description_en
+    title_en, description_en, link
   } = req.body
   if (!title || price == null) return res.status(400).json({ error: 'title y price son requeridos' })
 
@@ -1039,13 +1039,14 @@ router.post('/products', authenticateToken, requireAdmin, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO products (
          title, description, title_en, description_en,
-         price, weight, category_id, image_url,
+         price, weight, category_id, image_url, link,
          metadata, stock_qty, owner_id,
          duty_cents, keywords
        )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING id, title, description, title_en, description_en,
-                 price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+                 price, weight, category_id, image_url, link,
+                 metadata, stock_qty, owner_id,
                  duty_cents, keywords`,
       [
         String(title).trim(),
@@ -1056,6 +1057,7 @@ router.post('/products', authenticateToken, requireAdmin, async (req, res) => {
         weight || null,
         category_id || null,
         image_url || null,
+        link || null,
         JSON.stringify(cleanMeta),
         Number.isInteger(Number(stock_qty)) ? Number(stock_qty) : 0,
         (Number.isInteger(Number(owner_id)) ? Number(owner_id) : null),
@@ -1063,6 +1065,7 @@ router.post('/products', authenticateToken, requireAdmin, async (req, res) => {
         keywords.length ? keywords : null,
       ]
     )
+
     res.status(201).json(result.rows[0])
   } catch (error) {
     console.error(error)
@@ -1076,7 +1079,7 @@ router.post('/products', authenticateToken, requireAdmin, async (req, res) => {
 router.put('/products/:id', authenticateToken, requireAdmin, async (req, res) => {
   const {
     title, price, weight, category_id, image_url, description, stock_qty, owner_id,
-    title_en, description_en
+    title_en, description_en, link
   } = req.body
 
   const rawMeta = req.body?.metadata ?? {}
@@ -1106,16 +1109,18 @@ router.put('/products/:id', authenticateToken, requireAdmin, async (req, res) =>
              weight         = COALESCE($4, weight),
              category_id    = COALESCE($5, category_id),
              image_url      = COALESCE($6, image_url),
-             metadata       = COALESCE(metadata,'{}'::jsonb) || COALESCE($7::jsonb,'{}'::jsonb),
-             stock_qty      = COALESCE($8::int, stock_qty),
-             owner_id       = COALESCE($9::int, owner_id),
-             title_en       = COALESCE($10, title_en),
-             description_en = COALESCE($11, description_en),
-             duty_cents     = COALESCE($12, duty_cents),
-             keywords       = COALESCE($13::text[], keywords)
-       WHERE id = $14::int
+             link           = COALESCE($7, link),
+             metadata       = COALESCE(metadata,'{}'::jsonb) || COALESCE($8::jsonb,'{}'::jsonb),
+             stock_qty      = COALESCE($9::int, stock_qty),
+             owner_id       = COALESCE($10::int, owner_id),
+             title_en       = COALESCE($11, title_en),
+             description_en = COALESCE($12, description_en),
+             duty_cents     = COALESCE($13, duty_cents),
+             keywords       = COALESCE($14::text[], keywords)
+       WHERE id = $15::int
    RETURNING id, title, description, title_en, description_en,
-             price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+             price, weight, category_id, image_url, link,
+             metadata, stock_qty, owner_id,
              duty_cents, keywords
     `;
     const params = [
@@ -1125,6 +1130,7 @@ router.put('/products/:id', authenticateToken, requireAdmin, async (req, res) =>
       weight ?? null,
       category_id ?? null,
       image_url ?? null,
+      link ?? null,
       JSON.stringify(cleanMeta),
       stockInt,
       ownerInt,
@@ -1142,6 +1148,7 @@ router.put('/products/:id', authenticateToken, requireAdmin, async (req, res) =>
     console.error(error);
     res.status(500).send('Error al actualizar producto');
   }
+
 })
 
 /* ===================
@@ -1233,7 +1240,7 @@ router.get('/admin/products', authenticateToken, requireAdmin, async (req, res) 
     const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
     const sql = `
       SELECT id, title, description, title_en, description_en,
-             price, weight, category_id, image_url, metadata, stock_qty, owner_id,
+             price, weight, category_id, image_url, link, metadata, stock_qty, owner_id,
              duty_cents, keywords,
              COUNT(*) OVER() AS total
       FROM products
@@ -1333,7 +1340,7 @@ router.get('/products/category/:slug', async (req, res) => {
     const sql = `
       WITH src AS (
         SELECT id, title, description, title_en, description_en,
-               price, weight, category_id, image_url, metadata, stock_qty,
+               price, weight, category_id, image_url, link, metadata, stock_qty,
                owner_id, duty_cents, keywords
         FROM products p
         WHERE p.category_id = $1
@@ -1359,7 +1366,7 @@ router.get('/products/category/:slug', async (req, res) => {
       )
       SELECT
         id, title, description, title_en, description_en,
-        price, weight, category_id, image_url, metadata, stock_qty,
+        price, weight, category_id, image_url, link, metadata, stock_qty,
         owner_id, duty_cents, keywords,
         ROUND(effective_cents * (100 + margin_pct) / 100.0)::int AS price_with_margin_cents,
         ROUND(ROUND(effective_cents * (100 + margin_pct) / 100.0) / 100.0, 2) AS price_with_margin_usd

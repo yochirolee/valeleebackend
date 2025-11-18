@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS products (
   stock_qty INTEGER NOT NULL DEFAULT 0,
   category_id INTEGER REFERENCES categories(id),
   owner_id INTEGER REFERENCES owners(id) ON DELETE RESTRICT,
+  ink TEXT,
   metadata JSONB
 );
 
@@ -230,6 +231,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA extensions;
 ALTER TABLE products
   ADD COLUMN IF NOT EXISTS title_en TEXT,
   ADD COLUMN IF NOT EXISTS description_en TEXT,
+  ADD COLUMN IF NOT EXISTS link TEXT,          
   ADD COLUMN IF NOT EXISTS duty_cents INT DEFAULT 0,           -- arancel por unidad (centavos)
   ADD COLUMN IF NOT EXISTS keywords TEXT[] DEFAULT '{}'::text[];
 
@@ -282,6 +284,7 @@ ALTER TABLE products
   ADD COLUMN IF NOT EXISTS image_url TEXT,
   ADD COLUMN IF NOT EXISTS description TEXT,
   ADD COLUMN IF NOT EXISTS weight NUMERIC(10,2),
+  ADD COLUMN IF NOT EXISTS link TEXT,         
   ADD COLUMN IF NOT EXISTS metadata JSONB,
   ADD COLUMN IF NOT EXISTS owner_id INT,
   ADD COLUMN IF NOT EXISTS stock_qty INTEGER NOT NULL DEFAULT 0;
